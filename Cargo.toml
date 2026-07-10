@@ -1,0 +1,13 @@
+[package]
+name = "calx-mill"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+description = "A generic substrate-throughput modeler: occupancy + projection for any compute substrate (8088, AVX-512, GPU SM)."
+repository = "https://github.com/slartibardfast/calx-mill"
+publish = false
+
+[dependencies]
+# The Kani verifier is NOT a crates.io dependency: `cargo kani` provides its own
+# `kani` crate and sets the `kani` cfg. Proof harnesses are #[cfg(kani)]-gated, so
+# plain `cargo build`/`cargo test` never reference it. See README for install.
