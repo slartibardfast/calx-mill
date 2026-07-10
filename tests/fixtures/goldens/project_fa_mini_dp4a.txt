@@ -1,0 +1,10 @@
+PPM: 416.0 cycles/iter (bound: issue)
+ADD: 1175.9 cycles/iter
+  issue             416.0
+  pipe:alu          310.9
+  pipe:fma          288.0
+  pipe:own_xu       256.0
+  mem               240.1
+  pipe:own           48.9
+  smem               32.0
+  defaulted rates: BAR.SYNC BMOV.32.CLEAR LEA MOV S2UR ULDC.64

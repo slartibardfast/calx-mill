@@ -1,0 +1,7 @@
+PPM: 576.0 cycles/iter (bound: pipe:fma)
+ADD: 696.3 cycles/iter
+  pipe:fma          576.0
+  issue             352.0
+  pipe:alu           72.3
+  mem                48.0
+  defaulted rates: BAR.SYNC MOV S2UR ULDC.64

@@ -152,6 +152,125 @@ pub fn project(
     }
 }
 
+/// Which resource class a fractional steady-state demand belongs to. Substrate-
+/// generic: a pipe is an index into the caller's own pipe naming; the other three
+/// axes (local-store bandwidth, memory bandwidth, the issue cap) exist on every
+/// substrate that has them at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResourceKind {
+    Pipe(usize),
+    LocalStoreBw,
+    MemoryBw,
+    Issue,
+}
+
+/// A fractional steady-state projection: the per-resource cycle demands in
+/// evaluation order, the per-pipe-max (PPM) result, and the naive-additive (ADD)
+/// result reported alongside (never gated).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteadyState {
+    /// every resource's cycle demand, in the order they were evaluated.
+    pub per_resource: Vec<(ResourceKind, f64)>,
+    /// the PPM projection: the largest per-resource demand.
+    pub ppm_cycles: f64,
+    /// index into `per_resource` of the binding resource (first max wins).
+    pub ppm_bound: usize,
+    /// the additive model: every non-issue demand summed; if that sum is not
+    /// positive, the issue demand (an all-control workload still issues).
+    pub add_cycles: f64,
+}
+
+/// Build the fractional per-resource demand vector for one work unit scaled by
+/// `concurrency` concurrent units. `pipe_cycles[i]` is pipe i's accumulated
+/// issue-cycle demand (the caller's op-mix fold, `sum(ops / rate)`); a local-store
+/// or memory demand of exactly zero means "absent" and emits no entry. Order:
+/// pipes, local store, memory, issue - `select_bound`'s first-max-wins tie-break
+/// binds on this order.
+pub fn mix_demands(
+    concurrency: f64,
+    pipe_cycles: &[f64],
+    local_store_cycles: f64,
+    mem_bytes: f64,
+    mem_bytes_per_cycle: f64,
+    total_ops: f64,
+    issue_cap: f64,
+) -> Vec<(ResourceKind, f64)> {
+    let mut v = Vec::with_capacity(pipe_cycles.len() + 3);
+    for (i, &c) in pipe_cycles.iter().enumerate() {
+        v.push((ResourceKind::Pipe(i), concurrency * c));
+    }
+    if local_store_cycles != 0.0 {
+        v.push((ResourceKind::LocalStoreBw, concurrency * local_store_cycles));
+    }
+    if mem_bytes != 0.0 {
+        v.push((ResourceKind::MemoryBw, concurrency * mem_bytes / mem_bytes_per_cycle));
+    }
+    v.push((ResourceKind::Issue, concurrency * total_ops / issue_cap));
+    v
+}
+
+/// PPM + ADD selection over a demand vector. The binding resource is the first
+/// entry with the maximal demand (a stable max scan: a later entry must be
+/// strictly greater to displace an earlier one). An empty vector yields a zero
+/// projection rather than panicking.
+pub fn select_bound(per_resource: &[(ResourceKind, f64)]) -> SteadyState {
+    if per_resource.is_empty() {
+        return SteadyState {
+            per_resource: Vec::new(),
+            ppm_cycles: 0.0,
+            ppm_bound: 0,
+            add_cycles: 0.0,
+        };
+    }
+    let mut bound = 0usize;
+    for i in 1..per_resource.len() {
+        if per_resource[i].1 > per_resource[bound].1 {
+            bound = i;
+        }
+    }
+    let mut add = 0.0f64;
+    let mut issue = None;
+    for &(kind, cycles) in per_resource {
+        if kind == ResourceKind::Issue {
+            issue = Some(cycles);
+        } else {
+            add += cycles;
+        }
+    }
+    let add_cycles = if add > 0.0 { add } else { issue.unwrap_or(add) };
+    SteadyState {
+        per_resource: per_resource.to_vec(),
+        ppm_cycles: per_resource[bound].1,
+        ppm_bound: bound,
+        add_cycles,
+    }
+}
+
+/// The fractional-rate per-pipe-max projection: `mix_demands` folded through
+/// `select_bound`. This is `project` generalized to fractional rates and an
+/// explicit local-store bandwidth axis.
+pub fn project_mix(
+    concurrency: f64,
+    pipe_cycles: &[f64],
+    local_store_cycles: f64,
+    mem_bytes: f64,
+    mem_bytes_per_cycle: f64,
+    total_ops: f64,
+    issue_cap: f64,
+) -> SteadyState {
+    select_bound(&mix_demands(
+        concurrency,
+        pipe_cycles,
+        local_store_cycles,
+        mem_bytes,
+        mem_bytes_per_cycle,
+        total_ops,
+        issue_cap,
+    ))
+}
+
+pub mod nvidia;
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -222,6 +341,63 @@ mod proofs {
         let p = occupancy_pct(&s, &w);
         kani::assume(s.concurrency_ceiling > 0);
         kani::assert(p <= 100, "occupancy in [0,100]");
+    }
+
+    fn any_demand_value() -> f64 {
+        // finite: a demand is cycles of work; the ADD sum of two opposite
+        // infinities would manufacture a NaN no real workload can produce.
+        let v: f64 = kani::any();
+        kani::assume(v.is_finite());
+        v
+    }
+
+    #[kani::proof]
+    fn select_bound_picks_the_first_maximal_demand() {
+        let demands = [
+            (ResourceKind::Pipe(0), any_demand_value()),
+            (ResourceKind::Pipe(1), any_demand_value()),
+            (ResourceKind::LocalStoreBw, any_demand_value()),
+            (ResourceKind::MemoryBw, any_demand_value()),
+            (ResourceKind::Issue, any_demand_value()),
+        ];
+        let r = select_bound(&demands);
+        kani::assert(r.ppm_bound < demands.len(), "bound index is in range");
+        kani::assert(
+            r.ppm_cycles == demands[r.ppm_bound].1,
+            "PPM equals the demand it names",
+        );
+        let mut i = 0;
+        while i < demands.len() {
+            kani::assert(!(demands[i].1 > r.ppm_cycles), "no demand exceeds the PPM");
+            i += 1;
+        }
+        let mut j = 0;
+        while j < r.ppm_bound {
+            kani::assert(!(demands[j].1 >= r.ppm_cycles), "first max wins");
+            j += 1;
+        }
+    }
+
+    #[kani::proof]
+    fn select_bound_add_falls_back_to_issue_when_no_work() {
+        let issue = any_demand_value();
+        let demands = [
+            (ResourceKind::Pipe(0), 0.0),
+            (ResourceKind::LocalStoreBw, 0.0),
+            (ResourceKind::Issue, issue),
+        ];
+        let r = select_bound(&demands);
+        kani::assert(
+            r.add_cycles == issue,
+            "an all-control workload's ADD is its issue demand",
+        );
+    }
+
+    #[kani::proof]
+    fn select_bound_handles_the_empty_vector() {
+        let r = select_bound(&[]);
+        kani::assert(r.ppm_cycles == 0.0, "empty demand vector projects zero");
+        kani::assert(r.add_cycles == 0.0, "empty demand vector adds zero");
     }
 
     #[kani::proof]

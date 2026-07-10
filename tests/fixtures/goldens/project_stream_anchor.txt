@@ -1,0 +1,7 @@
+PPM: 3343.0 cycles/iter (bound: mem)
+ADD: 3765.2 cycles/iter
+  mem              3343.0
+  issue             272.0
+  pipe:alu          226.2
+  pipe:fma          196.0
+  defaulted rates: BAR.SYNC MOV UIMAD ULDC ULDC.64
