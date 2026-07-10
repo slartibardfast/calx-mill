@@ -1,0 +1,9 @@
+census-match: A=1 kernel(s), B=1 kernel(s); tolerance +-10.0pp
+  fma      A  97.7%  B  48.5%  |d|  49.2pp  EXCEEDS
+  half     A   0.0%  B   0.0%  |d|   0.0pp  ok
+  alu      A   1.5%  B  50.8%  |d|  49.2pp  EXCEEDS
+  xu       A   0.0%  B   0.0%  |d|   0.0pp  ok
+  lsu      A   0.0%  B   0.0%  |d|   0.0pp  ok
+  control  A   0.8%  B   0.8%  |d|   0.0pp  ok
+  other    A   0.0%  B   0.0%  |d|   0.0pp  ok
+census-match: FAIL (worst 49.2pp)

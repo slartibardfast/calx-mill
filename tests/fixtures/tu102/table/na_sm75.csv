@@ -1,0 +1,4 @@
+row_id,instruction,prior_src,notes
+mem.cpasync,NA_SM75,ptx_isa:cp.async,cp.async / LDGSTS require sm_80+; explicit absence
+sync.asyncbar,NA_SM75,ptx_isa:mbarrier,asynchronous barriers (mbarrier) require sm_80+
+mem.l2.residency,NA_SM75,ptx_isa:l2-cache-hints,L2 residency controls (annotated pointers) require sm_80+

@@ -1,0 +1,6 @@
+PASS fn<latbound_demo>: 128 primary, 131 instrs, 2096 B
+PASS fn<capmix_anchor>: 128 primary, 132 instrs, 2112 B (+1 staging)
+PASS fn<smemtile_anchor>: 64 primary, 163 instrs, 2608 B
+PASS fn<stream_anchor>: 16 primary, 100 instrs, 1600 B (+1 staging)
+PASS fn<ffma_anchor>: 128 primary, 131 instrs, 2096 B
+5 kernels checked, 0 failures

@@ -1,0 +1,1 @@
+EXEMPT fa_mini.bin: composite kernels; gated by census-match mode instead

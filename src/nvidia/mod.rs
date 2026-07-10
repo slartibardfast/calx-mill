@@ -8,8 +8,12 @@
 //! byte-for-byte output parity by differential tests against goldens generated
 //! from the Python (see `tests/fixtures/README.md`).
 
+pub mod check;
 pub mod csvio;
+pub mod mktable;
 pub mod pattern;
 pub mod projection;
 pub mod pyfmt;
+pub mod sass;
 pub mod table;
+pub mod verify;

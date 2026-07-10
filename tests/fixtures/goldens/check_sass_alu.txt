@@ -1,0 +1,40 @@
+PASS tput_kernel<OpIDIV_U32>: sequence op, 301 instrs, 4816 B (no purity gate)
+PASS tput_kernel<OpDFMA>: 128 primary, 131 instrs, 2096 B
+PASS tput_kernel<OpDADD>: 128 primary, 131 instrs, 2096 B
+PASS tput_kernel<OpHFMA2>: 128 primary, 136 instrs, 2176 B (+5 staging: IMAD PRMT ULDC)
+PASS tput_kernel<OpIDP4A_U8>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS tput_kernel<OpIDP4A_S8>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS tput_kernel<OpPRMT>: 128 primary, 137 instrs, 2192 B (+6 staging: IMAD ULDC)
+PASS tput_kernel<OpFLO>: 128 primary, 131 instrs, 2096 B
+PASS tput_kernel<OpPOPC>: 128 primary, 131 instrs, 2096 B
+PASS tput_kernel<OpFSETPSEL>: 256 primary, 259 instrs, 4144 B
+PASS tput_kernel<OpISETPSEL>: 257 primary, 259 instrs, 4144 B
+PASS tput_kernel<OpSEL>: 128 primary, 132 instrs, 2112 B
+PASS tput_kernel<OpSHF>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS tput_kernel<OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS tput_kernel<OpIMAD>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS tput_kernel<OpIADD3>: 257 primary, 259 instrs, 4144 B
+PASS tput_kernel<OpFMUL>: 128 primary, 131 instrs, 2096 B
+PASS tput_kernel<OpFADD>: 128 primary, 131 instrs, 2096 B
+PASS tput_kernel<OpFFMA>: 128 primary, 131 instrs, 2096 B
+PASS lat_kernel<OpFSETPSEL>: 256 primary, 259 instrs, 4144 B
+PASS lat_kernel<OpFSEL>: 128 primary, 132 instrs, 2112 B
+PASS lat_kernel<OpISETPSEL>: 257 primary, 259 instrs, 4144 B
+PASS lat_kernel<OpSEL>: 128 primary, 132 instrs, 2112 B
+PASS lat_kernel<OpIDIV_U32>: sequence op, 301 instrs, 4816 B (no purity gate)
+PASS lat_kernel<OpDFMA>: 128 primary, 133 instrs, 2128 B (+2 staging: IMAD MOV)
+PASS lat_kernel<OpDADD>: 128 primary, 131 instrs, 2096 B
+PASS lat_kernel<OpHFMA2>: 128 primary, 136 instrs, 2176 B (+5 staging: IMAD PRMT ULDC)
+PASS lat_kernel<OpIDP4A_U8>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS lat_kernel<OpIDP4A_S8>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS lat_kernel<OpPRMT>: 128 primary, 134 instrs, 2144 B (+3 staging: IMAD ULDC)
+PASS lat_kernel<OpFLO>: 128 primary, 131 instrs, 2096 B
+PASS lat_kernel<OpPOPC>: 128 primary, 131 instrs, 2096 B
+PASS lat_kernel<OpSHF>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS lat_kernel<OpIADD3>: 257 primary, 259 instrs, 4144 B
+PASS lat_kernel<OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS lat_kernel<OpIMAD>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS lat_kernel<OpFMUL>: 128 primary, 131 instrs, 2096 B
+PASS lat_kernel<OpFADD>: 128 primary, 131 instrs, 2096 B
+PASS lat_kernel<OpFFMA>: 128 primary, 131 instrs, 2096 B
+39 kernels checked, 0 failures

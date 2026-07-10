@@ -1,0 +1,39 @@
+row_id,prior_value,prior_unit,prior_src,prior_notes
+alu.ffma.lat,4,cycles,jia2019turing:tab4.1,Turing row: IADD3/SHF/LOP3/SEL/MOV/FADD/FFMA/FMUL/ISETP/FSET/FSETP = 4
+alu.fadd.lat,4,cycles,jia2019turing:tab4.1,
+alu.fmul.lat,4,cycles,jia2019turing:tab4.1,
+alu.iadd3.lat,4,cycles,jia2019turing:tab4.1,
+alu.lop3.lat,4,cycles,jia2019turing:tab4.1,
+alu.shf.lat,4,cycles,jia2019turing:tab4.1,
+alu.sel.lat,4,cycles,jia2019turing:tab4.1,
+alu.isetp.lat,4,cycles,jia2019turing:tab4.1,
+alu.fsetp.lat,4,cycles,jia2019turing:tab4.1,
+alu.imad.lat,5,cycles,jia2019turing:tab4.1,Turing row: IMAD/FMNMX/DSET/DSETP = 5
+alu.hfma2.lat,6,cycles,jia2019turing:tab4.1,Turing row: HADD2/HMUL2/HFMA2 = 6
+alu.popc.lat,15,cycles,jia2019turing:tab4.1,Turing row: POPC/FLO/BREV/MUFU ~ 15 (paper marks approximate)
+alu.flo.lat,15,cycles,jia2019turing:tab4.1,approximate in source
+alu.dadd.lat,48,cycles,jia2019turing:tab4.1,Turing row: DADD/DMUL ~ 48 (approximate in source)
+alu.dfma.lat,54,cycles,jia2019turing:tab4.1,Turing row: DFMA/DSET/DSETP ~ 54 (approximate in source)
+alu.ffma.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,64 FP32 lanes per SM = 2 warpinst/SM/clk
+alu.fadd.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,
+alu.fmul.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,
+alu.iadd3.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,64 INT32 lanes per SM
+alu.imad.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,
+alu.lop3.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,
+alu.hfma2.tput,2.0,warpinst/SM/clk,nvidia2018turing:sec-sm,FP16x2 at FP32 issue rate; 2x FLOPs per inst
+alu.dadd.tput,0.0625,warpinst/SM/clk,nvidia2018turing:sec-sm,2 FP64 lanes per SM = 1/32 of FP32
+alu.dfma.tput,0.0625,warpinst/SM/clk,nvidia2018turing:sec-sm,
+mem.smem.lat,22,cycles,jia2019turing:fig3.11,T4 curve conflict-free point; figure-read approximate (no scalar in text)
+mem.smem.lat.conflict32,85,cycles,jia2019turing:fig3.11,T4 curve 32-way point; figure-read approximate
+mem.l1.lat,32,cycles,jia2019turing:sec3.1.1,exact in text: L1 data cache hit latency 32 cycles on T4
+mem.smem.bw,64,B/clk/SM,jia2019turing:fig3.12,theoretical model min(P*Bs*ws*fg ...); T4 measured ~88 pct of theoretical
+sfu.mufu.ex2.lat,15,cycles,jia2019turing:tab4.1,Turing row: POPC/FLO/BREV/MUFU ~ 15 (approximate in source)
+atomics.shared.add.lat,8,cycles,jia2019turing:tab4.2,T4 shared atomicAdd no contention (exact)
+atomics.shared.add.lat.contention2,10,cycles,jia2019turing:tab4.2,
+atomics.shared.add.lat.contention4,14,cycles,jia2019turing:tab4.2,
+atomics.shared.add.lat.contention8,22,cycles,jia2019turing:tab4.2,
+atomics.shared.add.lat.contention16,37,cycles,jia2019turing:tab4.2,
+atomics.shared.add.lat.contention32,69,cycles,jia2019turing:tab4.2,
+tensor.hmma.1688.tput.sweepf16acc,0.5,warpinst/SM/clk,nvidia2018turing:sec-tc,8 TC/SM x 64 FP16-FMA/clk = 512 FMA/SM/clk over 1024 MAC/inst
+tensor.hmma.1688.tput.sweepf32acc,0.25,warpinst/SM/clk,nvidia2018turing:sec-tc,f32 accumulate at half the f16 rate
+tensor.imma.8816.tput,1.0,warpinst/SM/clk,nvidia2018turing:sec-tc,INT8 at 2x FP16 ops over 1024 MAC/inst

@@ -1,0 +1,24 @@
+kernel                         measured        PPM     err         ADD bound       
+proj.anchor.ffma                  517.3      512.0   -1.0%       520.1 pipe:fma     PASS
+proj.anchor.stream               2915.8     2815.1   -3.5%      3149.2 mem          PASS
+proj.anchor.smemtile              512.2      512.0   -0.0%      1035.6 smem         PASS
+proj.anchor.capmix                280.4      272.1   -3.0%       528.1 pipe:alu     PASS
+proj.anchor.latbound              521.0       64.0  -87.7%        65.0 pipe:fma     demo
+proj.fa_mini.base                 343.1      258.0  -24.8%       707.9 issue        FAIL
+proj.fa_mini.dp4a                 407.9      248.0  -39.2%       735.3 issue        FAIL
+proj.fa_mini.staged               746.2      576.0  -22.8%      1149.8 smem         FAIL
+proj.inject.base.k0               281.5      231.2  -17.9%       543.2 pipe:alu     PASS
+proj.inject.ffma.k8               287.1      240.0  -16.4%       575.2 issue        PASS
+proj.inject.ffma.k16              312.9      256.0  -18.2%       607.3 issue        PASS
+proj.inject.ffma.k24              337.4      272.0  -19.4%       639.4 issue        PASS
+proj.inject.idp4a.k8              283.0      242.0  -14.5%       579.2 issue        PASS
+proj.inject.idp4a.k16             316.9      258.0  -18.6%       611.2 issue        PASS
+proj.inject.idp4a.k24             315.1      274.0  -13.0%       643.3 issue        PASS
+proj.inject.lop3.k8               293.3      243.4  -17.0%       579.5 pipe:alu     PASS
+proj.inject.lop3.k16              317.0      267.9  -15.5%       611.9 pipe:alu     PASS
+proj.inject.lop3.k24              375.4      292.3  -22.2%       644.3 pipe:alu     FAIL
+proj.inject.popc.k4               280.8      232.0  -17.4%       607.0 issue        PASS
+proj.inject.popc.k8               305.0      240.0  -21.3%       671.0 issue        FAIL
+proj.inject.popc.k12              345.3      248.0  -28.2%       735.0 issue        FAIL
+
+verify_projection: 6 gate failure(s)

@@ -1,0 +1,43 @@
+PASS mix_kernel<OpDFMA+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpDFMA+OpFFMA>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpDFMA>: 128 primary, 131 instrs, 2096 B
+PASS mix_kernel<OpDADD+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpDADD+OpFFMA>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpDADD>: 128 primary, 131 instrs, 2096 B
+PASS mix_kernel<OpHFMA2+OpLOP3>: 128 primary, 137 instrs, 2192 B (+6 staging: IMAD PRMT ULDC)
+PASS mix_kernel<OpFFMA+OpHFMA2>: 128 primary, 136 instrs, 2176 B (+5 staging: MOV PRMT ULDC)
+PASS pure_kernel<OpHFMA2>: 128 primary, 136 instrs, 2176 B (+5 staging: IMAD PRMT ULDC)
+PASS mix_kernel<OpFLO+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpFLO>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpFLO>: 128 primary, 131 instrs, 2096 B
+PASS mix_kernel<OpLOP3+OpPOPC>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpPOPC>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpPOPC>: 128 primary, 131 instrs, 2096 B
+PASS mix_kernel<OpIDP4A_S8+OpLOP3>: 128 primary, 133 instrs, 2128 B (+2 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpIDP4A_S8>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS pure_kernel<OpIDP4A_S8>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+FAIL mix_kernel<OpLOP3+OpPRMT>: 11 non-primary ops in timed loop (budget 6): IMAD ULDC
+PASS mix_kernel<OpFFMA+OpPRMT>: 128 primary, 136 instrs, 2176 B (+5 staging: IMAD MOV ULDC)
+PASS pure_kernel<OpPRMT>: 128 primary, 137 instrs, 2192 B (+6 staging: IMAD ULDC)
+PASS mix_kernel<OpLOP3+OpSEL>: 128 primary, 133 instrs, 2128 B (+1 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpSEL>: 128 primary, 132 instrs, 2112 B
+PASS pure_kernel<OpSEL>: 128 primary, 132 instrs, 2112 B
+PASS mix_kernel<OpLOP3+OpSHF>: 128 primary, 133 instrs, 2128 B (+2 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpSHF>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS pure_kernel<OpSHF>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpIMAD+OpLOP3>: 130 primary, 133 instrs, 2128 B
+PASS mix_kernel<OpFFMA+OpIMAD>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS pure_kernel<OpIMAD>: 128 primary, 132 instrs, 2112 B (+1 staging: MOV)
+PASS mix_kernel<OpLOP3>: 128 primary, 133 instrs, 2128 B (+2 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpFMUL+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpFFMA+OpFMUL>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpFMUL>: 128 primary, 131 instrs, 2096 B
+PASS mix_kernel<OpFADD+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpFADD+OpFFMA>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpFADD>: 128 primary, 131 instrs, 2096 B
+PASS mix_kernel<OpFFMA+OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS mix_kernel<OpFFMA>: 128 primary, 131 instrs, 2096 B
+PASS pure_kernel<OpLOP3>: 128 primary, 132 instrs, 2112 B (+1 staging: IMAD)
+PASS pure_kernel<OpFFMA>: 128 primary, 131 instrs, 2096 B
+42 kernels checked, 1 failures
