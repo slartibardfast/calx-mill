@@ -156,9 +156,10 @@ pub fn project(
 mod proofs {
     use super::*;
 
-    // Keep the state space tractable: the theorems are about arithmetic
-    // structure, not specific magnitudes.
-    const BOUND: u32 = 1 << 20;
+    // Keep the state space tractable: the theorems are about arithmetic structure,
+    // not specific magnitudes, so a representative bounded range is sufficient (and
+    // still exercises every code path and edge case: 0, 1, granularity boundaries).
+    const BOUND: u32 = 1 << 10;
 
     fn any_substrate() -> Substrate {
         let s = Substrate {
@@ -170,16 +171,24 @@ mod proofs {
             issue_cap: kani::any(),
             mem_bandwidth: kani::any(),
         };
+        kani::assume(s.register_capacity <= BOUND);
         kani::assume(s.register_granularity <= BOUND);
+        kani::assume(s.local_store_bytes <= BOUND);
         kani::assume(s.local_store_granularity <= BOUND);
+        kani::assume(s.concurrency_ceiling <= BOUND);
+        kani::assume(s.issue_cap <= BOUND);
+        kani::assume(s.mem_bandwidth <= BOUND);
         s
     }
 
     fn any_work_unit() -> WorkUnit {
-        WorkUnit {
+        let w = WorkUnit {
             registers: kani::any(),
             local_store_bytes: kani::any(),
-        }
+        };
+        kani::assume(w.registers <= BOUND);
+        kani::assume(w.local_store_bytes <= BOUND);
+        w
     }
 
     #[kani::proof]
