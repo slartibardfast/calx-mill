@@ -11,6 +11,8 @@
 pub mod check;
 pub mod csvio;
 pub mod mktable;
+pub mod ncu;
+pub mod ptxas;
 pub mod pattern;
 pub mod projection;
 pub mod pyfmt;

@@ -1,0 +1,11 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z11tile_reducePKfPf' for 'sm_75'
+ptxas info    : Function properties for _Z11tile_reducePKfPf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 29 registers, used 1 barriers, 8448 bytes smem, 368 bytes cmem[0]
+ptxas info    : Compile time = 9.398 ms
+ptxas info    : Compiling entry function 'axpy' for 'sm_75'
+ptxas info    : Function properties for axpy
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 10 registers, used 0 barriers, 380 bytes cmem[0]
+ptxas info    : Compile time = 1.050 ms

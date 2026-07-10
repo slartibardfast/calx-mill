@@ -261,6 +261,73 @@ fn mk_table_reproduces_the_committed_table_byte_for_byte() {
     assert_eq!(out, fixture("tu102/table/tu102_ops.csv"));
 }
 
+// ptxas -v parsing over real nvcc output (compiled without a GPU).
+#[test]
+fn ptxas_v_parses_the_two_kernel_probe() {
+    use calx_mill::nvidia::ptxas::parse_ptxas_v;
+    let usage = parse_ptxas_v(&fixture("ptxas/ptxas_v_fixture.txt"));
+    assert_eq!(usage.len(), 2);
+    let tile = &usage[0];
+    assert_eq!(tile.name, "_Z11tile_reducePKfPf");
+    assert_eq!(tile.arch, "sm_75");
+    assert_eq!(tile.registers, 29);
+    assert_eq!(tile.barriers, 1);
+    assert_eq!(tile.smem_bytes, 8448);
+    assert_eq!(tile.cmem_bytes, vec![(0, 368)]);
+    assert_eq!((tile.stack_frame, tile.spill_stores, tile.spill_loads), (0, 0, 0));
+    let axpy = &usage[1];
+    assert_eq!(axpy.name, "axpy");
+    assert_eq!(axpy.registers, 10);
+    assert_eq!(axpy.barriers, 0);
+    assert_eq!(axpy.smem_bytes, 0);
+    assert_eq!(axpy.cmem_bytes, vec![(0, 380)]);
+}
+
+#[test]
+fn ptxas_v_parses_the_anchor_bench_and_folds_occupancy() {
+    use calx_mill::concurrency;
+    use calx_mill::nvidia::ptxas::{parse_ptxas_v, tu102_sm, work_unit};
+    let usage = parse_ptxas_v(&fixture("ptxas/ptxas_v_anchors.txt"));
+    assert_eq!(usage.len(), 6);
+    let smemtile = usage
+        .iter()
+        .find(|k| k.name.contains("smemtile_anchor"))
+        .expect("smemtile anchor present");
+    assert_eq!(smemtile.registers, 53);
+    assert_eq!(smemtile.smem_bytes, 8192);
+    // 53 regs/thread x 32 = 1696 -> 1792 at the 256-reg allocation unit ->
+    // 65536/1792 = 36 by registers; 8192 B over 8 warps = 1024 B/warp ->
+    // 65536/1024 = 64 by smem; the 32-warp ceiling binds.
+    let w = work_unit(smemtile, 256);
+    assert_eq!(w.registers, 1696);
+    assert_eq!(w.local_store_bytes, 1024);
+    assert_eq!(concurrency(&tu102_sm(), &w), 32);
+    // a register-heavy configuration: 128 regs/thread -> 4096/warp -> 16 warps
+    let heavy = calx_mill::WorkUnit { registers: 128 * 32, local_store_bytes: 0 };
+    assert_eq!(concurrency(&tu102_sm(), &heavy), 16);
+}
+
+// ncu --csv parsing over the documented-format fixture (no raw export is
+// checked in; pending real-data validation, see fixtures README).
+#[test]
+fn ncu_csv_parses_metrics_and_achieved_occupancy() {
+    use calx_mill::nvidia::ncu::{achieved_occupancy, metric_value, parse_ncu_csv};
+    let rows = parse_ncu_csv(&fixture("ncu/atomics_metrics.csv")).expect("fixture parses");
+    assert_eq!(rows.len(), 11);
+    let cycles = rows
+        .iter()
+        .find(|r| r.launch == "0" && r.metric == "sm__cycles_active.avg")
+        .expect("cycles metric present");
+    assert_eq!(cycles.kernel, "atom_shared_lat_kernel(unsigned int *, long long *)");
+    assert_eq!(cycles.unit, "cycle");
+    assert_eq!(metric_value(cycles), Some(45526.70)); // thousands separator stripped
+    let occ = achieved_occupancy(&rows);
+    assert_eq!(occ.len(), 2);
+    assert_eq!(occ[0].0, "0");
+    assert_eq!(occ[0].2, 3.08);
+    assert_eq!(occ[1].0, "1");
+}
+
 // verify_projection.py's whole gate table (measured medians x hot-loop
 // censuses x PPM), byte for byte, including its 6 gate failures on the
 // fixture SASS.
