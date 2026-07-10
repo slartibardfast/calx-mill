@@ -36,11 +36,28 @@ cargo kani
 The empirical anchor (the runtime `cudaOccupancy*` API, `ncu` achieved occupancy
 on a *compiled* kernel) stays outside Kani — measured truth, not proven.
 
+## The NVIDIA adapter
+
+`src/nvidia/` ports the tu102 reference measurement pipeline to Rust: the
+measured op-table ingest and PPM projection (`project.py`), the SASS op census
+(`sass_census.py`), the timed-loop purity gate (`check_sass.py`), the
+deterministic table generator (`mk_table.py`), the absolute projection gate
+(`verify_projection.py`), and parsers for `ptxas -v` resource usage and
+`ncu --csv` metric exports. Differential tests hold every port to
+byte-for-byte output parity against goldens generated from the Python
+(`tests/fixtures/README.md` records the provenance; the ncu fixture is
+documented-format, pending a live capture).
+
+The `calx-mill` binary exposes the pipeline: `project`, `census`,
+`check-sass` (incl. `--census-match`), `mk-table`, `verify-projection`,
+`ptxas`, `ncu`. Run `calx-mill --help` for the surface. `cargo build
+--release` is the whole build.
+
 ## Status
 
-Stand-up scaffold: the core types, the `concurrency` + `project` functions, the
-three-substrate test falsifier (8088 / AVX-512 / TU102), and the Kani harnesses.
-Adapters and the measurement pipeline land next.
+Core, Kani proofs, the three-substrate falsifier (8088 / AVX-512 / TU102),
+and the NVIDIA adapter's parity half (checked-in data only). The
+predicted-vs-measured close against live hardware is the next lane.
 
 ## License
 
