@@ -8,11 +8,11 @@ use calx_mill::nvidia::mktable::mk_table;
 use calx_mill::nvidia::ncu::{achieved_occupancy, parse_ncu_csv};
 use calx_mill::nvidia::pattern::Pattern;
 use calx_mill::nvidia::projection::{project, report, Census, MemClass};
-use calx_mill::nvidia::ptxas::{parse_ptxas_v, tu102_sm, work_unit};
+use calx_mill::nvidia::ptxas::{block, parse_ptxas_v, tu102_sm, work_unit, TU102_SMS};
 use calx_mill::nvidia::sass::{census_csv, census_per_kernel, sass_text};
 use calx_mill::nvidia::table::Rates;
 use calx_mill::nvidia::verify::verify_projection;
-use calx_mill::{concurrency, occupancy_pct};
+use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -36,9 +36,12 @@ commands:
   verify-projection <root>
       the absolute projection gate over a tu102-shaped tree
       (verify_projection.py)
-  ptxas <ptxas-v-output> [--block-threads N]
+  ptxas <ptxas-v-output> [--block-threads N] [--grid-blocks N]
+        [--instances N] [--block-smem B]
       parse `nvcc -Xptxas -v` resource usage; with a block size, fold each
-      kernel through the core's occupancy
+      kernel through the core's occupancy; with a grid, check cooperative
+      co-residency (blocks/instance x instances vs the grid, default 72
+      SMs; --block-smem overrides static smem with the dynamic launch value)
   ncu <export.csv>
       parse an `ncu --csv` metric export; achieved occupancy per launch
 
@@ -248,7 +251,10 @@ fn run() -> Result<i32, String> {
             Ok(exit)
         }
         "ptxas" => {
-            let args = Args::parse(rest, &["block-threads"])?;
+            let args = Args::parse(
+                rest,
+                &["block-threads", "grid-blocks", "instances", "block-smem"],
+            )?;
             let [path] = args.positional.as_slice() else {
                 return Err("ptxas: exactly one ptxas -v output file expected".into());
             };
@@ -261,7 +267,20 @@ fn run() -> Result<i32, String> {
                 Some(v) => Some(v.parse().map_err(|_| "--block-threads: bad value")?),
                 None => None,
             };
+            let grid_blocks: Option<u32> = match args.value("grid-blocks") {
+                Some(v) => Some(v.parse().map_err(|_| "--grid-blocks: bad value")?),
+                None => None,
+            };
+            let instances: u32 = args.number("instances", TU102_SMS)?;
+            let block_smem: Option<u32> = match args.value("block-smem") {
+                Some(v) => Some(v.parse().map_err(|_| "--block-smem: bad value")?),
+                None => None,
+            };
+            if grid_blocks.is_some() && block_threads.is_none() {
+                return Err("ptxas: --grid-blocks needs --block-threads".into());
+            }
             let s = tu102_sm();
+            let mut all_fit = true;
             for k in &usage {
                 print!(
                     "{}: {} regs, {} B smem, {} barriers, spills {}/{}",
@@ -276,10 +295,23 @@ fn run() -> Result<i32, String> {
                         occupancy_pct(&s, &w),
                         bt
                     );
+                    if let Some(g) = grid_blocks {
+                        let b = block(k, bt, block_smem);
+                        let per = blocks_per_instance(&s, &b);
+                        let fits = cooperative_fits(&s, &b, g, instances);
+                        all_fit &= fits;
+                        print!(
+                            ", {} blocks/instance, cooperative grid {} on {} instances: {}",
+                            per,
+                            g,
+                            instances,
+                            if fits { "fits" } else { "DEADLOCK" }
+                        );
+                    }
                 }
                 println!();
             }
-            Ok(0)
+            Ok(if all_fit { 0 } else { 1 })
         }
         "ncu" => {
             let args = Args::parse(rest, &[])?;

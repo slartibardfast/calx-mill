@@ -2,7 +2,7 @@
 //! usage, the static side of the occupancy fold. A real fixture costs nothing
 //! without a GPU - nvcc compiles and reports without one.
 
-use crate::{ceil_div, Substrate, WorkUnit};
+use crate::{ceil_div, Block, Substrate, WorkUnit};
 
 /// One kernel's `ptxas info` resource report.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -121,5 +121,19 @@ pub fn work_unit(usage: &KernelUsage, block_threads: u32) -> WorkUnit {
     WorkUnit {
         registers: usage.registers * 32,
         local_store_bytes: ceil_div(usage.smem_bytes, warps_per_block),
+    }
+}
+
+/// SMs on a TU102 (the co-residency instance count for a cooperative launch).
+pub const TU102_SMS: u32 = 72;
+
+/// Fold one kernel's usage into the core's exact block form. `smem_bytes`
+/// overrides the static `ptxas -v` figure when given (dynamic shared memory
+/// is a launch parameter ptxas cannot see).
+pub fn block(usage: &KernelUsage, block_threads: u32, smem_bytes: Option<u32>) -> Block {
+    Block {
+        units: ceil_div(block_threads.max(1), 32).max(1),
+        unit_registers: usage.registers * 32,
+        local_store_bytes: smem_bytes.unwrap_or(usage.smem_bytes),
     }
 }

@@ -99,6 +99,49 @@ pub fn occupancy_pct(s: &Substrate, w: &WorkUnit) -> u32 {
     (c * 100) / s.concurrency_ceiling
 }
 
+/// A block of concurrency units that co-allocate one local-store slab (GPU: a
+/// CTA of `units` warps sharing its shared-memory allocation). Blocks are the
+/// co-residency quantum of a cooperative launch: registers allocate per unit,
+/// local store once per block. Where [`WorkUnit`] folds a block's local store
+/// per unit as an approximation, this form is exact.
+#[derive(Clone, Copy)]
+pub struct Block {
+    /// concurrency units per block (GPU: warps per CTA). Zero fits nowhere.
+    pub units: u32,
+    /// per-unit register demand (GPU: regs/thread x 32).
+    pub unit_registers: u32,
+    /// local store per block, in bytes, allocated once for the whole block.
+    pub local_store_bytes: u32,
+}
+
+/// How many whole blocks fit on one substrate instance: the `min` of the
+/// register limit (units x rounded per-unit demand), the block-granular
+/// local-store limit, and the concurrency ceiling in whole blocks.
+pub fn blocks_per_instance(s: &Substrate, b: &Block) -> u32 {
+    if b.units == 0 {
+        return 0;
+    }
+    let reg_per_unit = round_up(b.unit_registers.max(1), s.register_granularity);
+    let reg_per_block = reg_per_unit.saturating_mul(b.units);
+    let by_reg = s.register_capacity / reg_per_block;
+    let by_local = if b.local_store_bytes == 0 || s.local_store_bytes == 0 {
+        u32::MAX
+    } else {
+        let ls_per = round_up(b.local_store_bytes, s.local_store_granularity).max(1);
+        s.local_store_bytes / ls_per
+    };
+    let by_ceiling = s.concurrency_ceiling / b.units;
+    by_reg.min(by_local).min(by_ceiling)
+}
+
+/// Cooperative-launch residency: a grid of `grid_blocks` blocks across
+/// `instances` substrate instances is feasible only if every block is
+/// co-resident at once — a cooperative grid barrier deadlocks otherwise.
+/// This is the check an occupancy number alone does not give you.
+pub fn cooperative_fits(s: &Substrate, b: &Block, grid_blocks: u32, instances: u32) -> bool {
+    blocks_per_instance(s, b).saturating_mul(instances) >= grid_blocks
+}
+
 /// Which resource binds the projection first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bottleneck {
@@ -412,5 +455,83 @@ mod proofs {
         let ca = concurrency(&s, &a);
         let cb = concurrency(&s, &b);
         kani::assert(ca >= cb, "fewer regs/work-unit => concurrency non-decreasing");
+    }
+
+    fn any_block() -> Block {
+        let b = Block {
+            units: kani::any(),
+            unit_registers: kani::any(),
+            local_store_bytes: kani::any(),
+        };
+        kani::assume(b.units <= BOUND);
+        kani::assume(b.unit_registers <= BOUND);
+        kani::assume(b.local_store_bytes <= BOUND);
+        b
+    }
+
+    #[kani::proof]
+    fn blocks_respect_every_capacity() {
+        let s = any_substrate();
+        let b = any_block();
+        kani::assume(b.units > 0);
+        let n = blocks_per_instance(&s, &b);
+        kani::assert(
+            n.saturating_mul(b.units) <= s.concurrency_ceiling,
+            "resident blocks respect the concurrency ceiling",
+        );
+        let reg_per_unit = round_up(b.unit_registers.max(1), s.register_granularity);
+        let total = (n as u64) * (reg_per_unit as u64) * (b.units as u64);
+        kani::assert(
+            total <= s.register_capacity as u64,
+            "resident blocks respect the register file",
+        );
+    }
+
+    #[kani::proof]
+    fn fewer_unit_registers_never_lower_blocks() {
+        let s = any_substrate();
+        let a = any_block();
+        let b = any_block();
+        kani::assume(a.units == b.units);
+        kani::assume(a.local_store_bytes == b.local_store_bytes);
+        kani::assume(a.unit_registers <= b.unit_registers);
+        kani::assert(
+            blocks_per_instance(&s, &a) >= blocks_per_instance(&s, &b),
+            "fewer regs/unit => blocks/instance non-decreasing",
+        );
+    }
+
+    #[kani::proof]
+    fn cooperative_fits_is_monotone_in_instances() {
+        let s = any_substrate();
+        let b = any_block();
+        let g: u32 = kani::any();
+        let i1: u32 = kani::any();
+        let i2: u32 = kani::any();
+        kani::assume(g <= BOUND);
+        kani::assume(i1 <= BOUND);
+        kani::assume(i2 <= BOUND);
+        kani::assume(i1 <= i2);
+        if cooperative_fits(&s, &b, g, i1) {
+            kani::assert(
+                cooperative_fits(&s, &b, g, i2),
+                "more instances never break residency",
+            );
+        }
+    }
+
+    #[kani::proof]
+    fn one_block_per_instance_is_the_persistent_kernel_shape() {
+        // grid == instances (one block per instance, the persistent-kernel
+        // launch) is feasible exactly when at least one block fits.
+        let s = any_substrate();
+        let b = any_block();
+        let n: u32 = kani::any();
+        kani::assume(n >= 1);
+        kani::assume(n <= BOUND);
+        kani::assert(
+            cooperative_fits(&s, &b, n, n) == (blocks_per_instance(&s, &b) >= 1),
+            "grid == instances iff one block fits per instance",
+        );
     }
 }

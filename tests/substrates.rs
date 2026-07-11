@@ -4,7 +4,10 @@
 //! `Substrate` abstraction leaked. These are hand-authored characterizations; the
 //! numbers are illustrative at the stand-up, refined when real adapters land.
 
-use calx_mill::{concurrency, occupancy_pct, project, Bottleneck, Substrate, WorkUnit};
+use calx_mill::{
+    blocks_per_instance, concurrency, cooperative_fits, occupancy_pct, project, Block, Bottleneck,
+    Substrate, WorkUnit,
+};
 
 /// Intel 8088 (~4.77 MHz): one ALU, a 4-byte prefetch queue as its only overlap,
 /// 14 registers, an 8-bit bus. Almost always fetch/memory-bound.
@@ -93,4 +96,31 @@ fn projection_names_the_binding_resource() {
     let s = avx512_core();
     let p = project(&s, &[2, 2, 1], &[1000, 1000, 0], 10);
     assert!(matches!(p.bottleneck, Bottleneck::Pipe(0) | Bottleneck::Pipe(1)));
+}
+
+#[test]
+fn tu102_cooperative_residency_is_a_register_cliff() {
+    // The megakernel-interpreter envelope (gate G11's shape): a persistent
+    // cooperative grid of one block per SM, 12 warps and a 60 KiB smem slab
+    // per block. 168 regs/thread is exactly feasible; the next warp
+    // allocation step (176) drops blocks/instance to zero, and a cooperative
+    // launch of it would deadlock — the check an occupancy percentage alone
+    // does not surface.
+    let s = tu102_sm();
+    let fits = Block {
+        units: 12,
+        unit_registers: 168 * 32,
+        local_store_bytes: 60 * 1024,
+    };
+    assert_eq!(blocks_per_instance(&s, &fits), 1);
+    assert!(cooperative_fits(&s, &fits, 72, 72));
+    let over = Block {
+        unit_registers: 176 * 32,
+        ..fits
+    };
+    assert_eq!(blocks_per_instance(&s, &over), 0);
+    assert!(!cooperative_fits(&s, &over, 72, 72));
+    // An oversubscribed grid of the feasible block also refuses: 2 blocks/SM
+    // is ceiling-bound at 12 warps (24 <= 32) but register-bound to 1.
+    assert!(!cooperative_fits(&s, &fits, 144, 72));
 }
