@@ -19,3 +19,21 @@ pub mod pyfmt;
 pub mod sass;
 pub mod table;
 pub mod verify;
+
+/// Map a ggml/GGUF element dtype name to its streamed byte width, for building
+/// a [`crate::Precision`] (call/0022). The accumulator width and pipe are the
+/// caller's choice (an op decides its accumulate dtype and whether it runs on
+/// the tensor or CUDA-core pipe); this fixes only the data-width half from the
+/// dtype. Block-quantized weights (Q4_0 etc.) are given their effective bytes
+/// per element (bpw/8) rounded up to at least 1, since the projection floors on
+/// streamed bytes.
+pub fn dtype_bytes(dtype: &str) -> u32 {
+    match dtype {
+        "F32" | "f32" => 4,
+        "F16" | "f16" | "BF16" | "bf16" => 2,
+        "Q8_0" | "q8_0" | "Q8_1" | "q8_1" | "I8" | "i8" => 1,
+        // block-quantized ~4.1-4.5 bpw -> 1 byte/elem effective (ceil).
+        "Q4_0" | "q4_0" | "Q4_0_AR16" | "q4_0_ar16" | "Q4_K" | "q4_k" => 1,
+        _ => 4, // unknown: assume full precision (conservative for bandwidth)
+    }
+}

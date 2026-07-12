@@ -142,6 +142,44 @@ pub fn cooperative_fits(s: &Substrate, b: &Block, grid_blocks: u32, instances: u
     blocks_per_instance(s, b).saturating_mul(instances) >= grid_blocks
 }
 
+/// The precision configuration of an op: the knob that DERIVES the three
+/// resource axes the core already models, rather than a fourth axis. It is
+/// strictly the PERFORMANCE half of the precision-performance frontier; the
+/// accuracy half is measured, not modelled here (see
+/// `reference/megakernel/precision_ledger.md`), and no accuracy term crosses
+/// this seam. Widths are in bytes so the core stays dtype-agnostic (an adapter
+/// maps q8/f16/f32/bf16 to these); `pipe` indexes the caller's own pipe naming
+/// (e.g. a tensor pipe for f16 HMMA vs a CUDA-core FMA pipe for f32).
+#[derive(Clone, Copy)]
+pub struct Precision {
+    /// accumulator element width in bytes (fp16=2, fp32=4, fp64=8). Sets the
+    /// accumulator's register footprint via [`acc_registers`].
+    pub acc_bytes: u32,
+    /// streamed element width in bytes (q8=1, f16=2, f32=4). Sets the streamed
+    /// byte total via [`stream_bytes`].
+    pub data_bytes: u32,
+    /// the compute pipe this precision dispatches to, an index into the
+    /// caller's `pipe_rates` (tensor vs CUDA-core, etc.).
+    pub pipe: usize,
+}
+
+/// Streamed bytes for `elems` elements at this precision's data width. This is
+/// the `total_bytes` / `mem_bytes` the projection floors by the memory budget,
+/// so halving the data width (f16 -> q8 KV) halves the memory-bound cycles.
+pub fn stream_bytes(elems: u32, p: &Precision) -> u32 {
+    elems.saturating_mul(p.data_bytes)
+}
+
+/// Per-concurrency-unit register demand at this precision: the
+/// precision-independent `base_registers` plus the accumulator's cost, which is
+/// `acc_elems` elements of `acc_bytes` each, packed into 32-bit registers
+/// (ceil). An fp32 accumulator (4 B) costs ~2x the registers of fp16 (2 B), so
+/// this is where accumulator precision buys back accuracy at an occupancy cost.
+pub fn acc_registers(base_registers: u32, acc_elems: u32, p: &Precision) -> u32 {
+    let acc_regs = ceil_div(acc_elems.saturating_mul(p.acc_bytes), 4);
+    base_registers.saturating_add(acc_regs)
+}
+
 /// Which resource binds the projection first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bottleneck {
@@ -377,6 +415,81 @@ mod proofs {
         kani::assert(c <= s.concurrency_ceiling, "concurrency bounded by the ceiling");
     }
 
+    // ---- precision dimension (call/0022) ----
+    // The two-axis theorem: data precision buys bandwidth, accumulator
+    // precision costs concurrency. Both DERIVE the existing resource axes, so
+    // the proofs compose with the core's own monotonicity, not a new model.
+
+    // Precision widths are byte widths of real dtypes (q8=1..fp64=8), and
+    // element counts fit a fragment/tile; bounding the MULTIPLICANDS to these
+    // realistic ranges keeps the u32 products small enough for CBMC while still
+    // exercising 0/1/boundary edges. The monotonicity theorems are structural,
+    // so this loses no generality.
+    const DTYPE_BYTES: u32 = 8; // fp64 is the widest we model
+    const ELEMS: u32 = 256; // accumulator elements / streamed elements per unit
+
+    // Underlying lemma: `project` is monotone non-decreasing in total_bytes,
+    // because cyc_mem = ceil_div(bytes, bw) is, and project == max(pipe, issue,
+    // mem). Bytes carried directly (no multiply): the full BOUND range is cheap.
+    #[kani::proof]
+    fn project_is_monotone_in_bytes() {
+        let s = any_substrate();
+        let rate: u32 = kani::any();
+        let ops: u32 = kani::any();
+        let b_lo: u32 = kani::any();
+        let b_hi: u32 = kani::any();
+        kani::assume(rate <= BOUND && ops <= BOUND && b_lo <= b_hi && b_hi <= BOUND);
+        let clo = project(&s, &[rate], &[ops], b_lo).cycles;
+        let chi = project(&s, &[rate], &[ops], b_hi).cycles;
+        kani::assert(clo <= chi, "fewer streamed bytes => projection never slower");
+    }
+
+    // Less data precision never makes a memory-bound projection slower: fewer
+    // bytes per element floor the projection at fewer memory cycles (composes
+    // stream_bytes monotonicity with the lemma above). q8 vs f16 KV is a
+    // projection, not a measurement.
+    #[kani::proof]
+    fn data_precision_buys_bandwidth() {
+        let s = any_substrate();
+        let elems: u32 = kani::any();
+        let d_lo: u32 = kani::any(); // lower precision (fewer bytes/elem)
+        let d_hi: u32 = kani::any();
+        kani::assume(elems <= ELEMS && d_lo <= d_hi && d_hi <= DTYPE_BYTES);
+        let lo = Precision { acc_bytes: 4, data_bytes: d_lo, pipe: 0 };
+        let hi = Precision { acc_bytes: 4, data_bytes: d_hi, pipe: 0 };
+        let rate: u32 = kani::any();
+        let ops: u32 = kani::any();
+        kani::assume(rate <= BOUND && ops <= BOUND);
+        let clo = project(&s, &[rate], &[ops], stream_bytes(elems, &lo)).cycles;
+        let chi = project(&s, &[rate], &[ops], stream_bytes(elems, &hi)).cycles;
+        kani::assert(clo <= chi, "lower data precision => projection never slower");
+    }
+
+    // More accumulator precision never raises concurrency: a wider accumulator
+    // costs more registers, and concurrency is monotone non-increasing in
+    // registers (composes acc_registers monotonicity with the core). fp32
+    // accumulate is an occupancy cost.
+    #[kani::proof]
+    fn acc_precision_costs_concurrency() {
+        let s = any_substrate();
+        let base: u32 = kani::any();
+        let acc_elems: u32 = kani::any();
+        let a_lo: u32 = kani::any(); // narrower accumulator
+        let a_hi: u32 = kani::any(); // wider accumulator
+        kani::assume(base <= BOUND && acc_elems <= ELEMS && a_lo <= a_hi && a_hi <= DTYPE_BYTES);
+        let ls: u32 = kani::any();
+        kani::assume(ls <= BOUND);
+        let lo = Precision { acc_bytes: a_lo, data_bytes: 2, pipe: 0 };
+        let hi = Precision { acc_bytes: a_hi, data_bytes: 2, pipe: 0 };
+        let w_lo = WorkUnit { registers: acc_registers(base, acc_elems, &lo), local_store_bytes: ls };
+        let w_hi = WorkUnit { registers: acc_registers(base, acc_elems, &hi), local_store_bytes: ls };
+        kani::assert(w_lo.registers <= w_hi.registers, "wider acc => more registers");
+        kani::assert(
+            concurrency(&s, &w_lo) >= concurrency(&s, &w_hi),
+            "wider accumulator precision => concurrency non-increasing",
+        );
+    }
+
     #[kani::proof]
     fn occupancy_is_in_unit_range() {
         let s = any_substrate();
@@ -533,5 +646,42 @@ mod proofs {
             cooperative_fits(&s, &b, n, n) == (blocks_per_instance(&s, &b) >= 1),
             "grid == instances iff one block fits per instance",
         );
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    // The two-axis frontier with concrete numbers (call/0022).
+    #[test]
+    fn data_width_halves_the_bytes() {
+        let q8 = Precision { acc_bytes: 4, data_bytes: 1, pipe: 0 };
+        let f16 = Precision { acc_bytes: 4, data_bytes: 2, pipe: 0 };
+        let f32 = Precision { acc_bytes: 4, data_bytes: 4, pipe: 0 };
+        assert_eq!(stream_bytes(1024, &q8), 1024);
+        assert_eq!(stream_bytes(1024, &f16), 2048);
+        assert_eq!(stream_bytes(1024, &f32), 4096);
+        // q8 KV is exactly half the streamed bytes of f16 KV (the +45% lever).
+        assert_eq!(2 * stream_bytes(1024, &q8), stream_bytes(1024, &f16));
+    }
+
+    #[test]
+    fn fp32_accumulate_costs_registers() {
+        // a 16x16 WMMA accumulator holds 8 elements per lane. base = the op's
+        // precision-independent registers.
+        let fp16 = Precision { acc_bytes: 2, data_bytes: 2, pipe: 0 };
+        let fp32 = Precision { acc_bytes: 4, data_bytes: 2, pipe: 0 };
+        assert_eq!(acc_registers(40, 8, &fp16), 40 + 4); // 8*2/4 = 4 regs
+        assert_eq!(acc_registers(40, 8, &fp32), 40 + 8); // 8*4/4 = 8 regs
+        // fp32 accumulate costs strictly more registers -> never more concurrency.
+        let s = Substrate {
+            register_capacity: 65536, register_granularity: 256,
+            local_store_bytes: 0, local_store_granularity: 128,
+            concurrency_ceiling: 32, issue_cap: 4, mem_bandwidth: 624,
+        };
+        let w16 = WorkUnit { registers: acc_registers(40, 8, &fp16) * 32, local_store_bytes: 0 };
+        let w32 = WorkUnit { registers: acc_registers(40, 8, &fp32) * 32, local_store_bytes: 0 };
+        assert!(concurrency(&s, &w16) >= concurrency(&s, &w32));
     }
 }
