@@ -442,6 +442,35 @@ pub fn unrolled_registers(base: u32, unroll: u32, per_iter_live: u32) -> u32 {
     base.saturating_add(unroll.saturating_mul(per_iter_live))
 }
 
+/// Independent dependency chains a register file can sustain.
+///
+/// [`OpTemplate::chains`] is a *request*; the scheduler keeps only as many live
+/// accumulator chains as the budget holds. This couples the register dimension to the
+/// latency dimension: raising `base_registers` — e.g. an overlap lever spending
+/// registers on a prefetch buffer — shrinks the chains left, which can re-expose a
+/// recurrence the isolated latency model treated as hidden (the register-file instance
+/// of "shared resources do not compose by `max`"; see call/0031).
+///
+/// # Arguments
+/// * `reg_budget` — per-thread register ceiling for the target occupancy (e.g.
+///   `65536 / block_threads` at one block per SM).
+/// * `base_registers` — registers held regardless of chain count (indices, pointers,
+///   shared operands).
+/// * `regs_per_chain` — live registers one independent accumulator chain costs
+///   (clamped to a minimum of 1 to avoid division by zero).
+///
+/// # Returns
+/// `(reg_budget - base_registers) / regs_per_chain`, floored at 0. Saturating; never
+/// panics.
+///
+/// # Guarantees
+/// One-way conservative: monotone non-decreasing in `reg_budget` and non-increasing in
+/// `base_registers`, so spending registers can only lower the result, never raise it
+/// (proof `spending_registers_never_raises_achievable_chains`).
+pub fn achievable_chains(reg_budget: u32, base_registers: u32, regs_per_chain: u32) -> u32 {
+    reg_budget.saturating_sub(base_registers) / regs_per_chain.max(1)
+}
+
 /// A composed op template: a dependency-structured op reduced to its latency-model
 /// inputs — `chains` independent chains, each `depth` dependent ops, on a pipe of
 /// reciprocal-throughput `cyc_per_op` and per-op `op_latency`. The convenience
@@ -472,6 +501,59 @@ impl OpTemplate {
     /// L/R (Little's Law). At or above it the recurrence is hidden.
     pub fn chains_to_hide(&self) -> u32 {
         ceil_div(self.op_latency, self.cyc_per_op.max(1))
+    }
+    /// Utilization once the register budget clamps the requested chains.
+    ///
+    /// Bounds `self.chains` by [`achievable_chains`], then returns
+    /// [`chain_utilization_pct`] at the clamped count. When a lever spends registers so
+    /// that the sustainable chains fall below `self.chains`, this drops below
+    /// [`utilization_pct`](Self::utilization_pct); since wall-time for fixed work scales
+    /// as `1 / utilization`, that drop is the leg's slowdown.
+    ///
+    /// # Arguments
+    /// * `reg_budget`, `base_registers`, `regs_per_chain` — see [`achievable_chains`].
+    ///
+    /// # Returns
+    /// Utilization percent (`0..=100`) at `min(self.chains, achievable_chains(..))`
+    /// chains, floored at one chain.
+    pub fn utilization_under_registers(
+        &self,
+        reg_budget: u32,
+        base_registers: u32,
+        regs_per_chain: u32,
+    ) -> u32 {
+        let ach = achievable_chains(reg_budget, base_registers, regs_per_chain)
+            .min(self.chains)
+            .max(1);
+        chain_utilization_pct(ach, self.depth, self.cyc_per_op, self.op_latency)
+    }
+    /// Whether an overlap lever that spends `spend` registers keeps the recurrence hidden.
+    ///
+    /// Composes the two dimensions the leg-level model keeps apart: overlapping the load
+    /// (the register `spend`) is only free if the compute leg still sustains enough
+    /// chains to reach the hide threshold.
+    ///
+    /// # Arguments
+    /// * `reg_budget`, `base_registers`, `regs_per_chain` — see [`achievable_chains`].
+    /// * `spend` — registers the overlap mechanism adds to `base_registers`.
+    ///
+    /// # Returns
+    /// `true` iff [`achievable_chains`] after the spend is at least
+    /// [`chains_to_hide`](Self::chains_to_hide); `false` flags a spend that re-exposes
+    /// the recurrence.
+    pub fn overlap_keeps_hidden(
+        &self,
+        reg_budget: u32,
+        base_registers: u32,
+        regs_per_chain: u32,
+        spend: u32,
+    ) -> bool {
+        let ach = achievable_chains(
+            reg_budget,
+            base_registers.saturating_add(spend),
+            regs_per_chain,
+        );
+        ach >= self.chains_to_hide()
     }
 }
 
@@ -876,6 +958,108 @@ mod proofs {
             "more unroll => never fewer registers (never falsely promises co-residency)",
         );
         kani::assert(unrolled_registers(base, u_lo, per) >= base, "estimate >= base");
+    }
+
+    // `achievable_chains` is one-way conservative in `base_registers`: spending
+    // registers can only lower the chains the file sustains (call/0031).
+    #[kani::proof]
+    fn spending_registers_never_raises_achievable_chains() {
+        let budget: u32 = kani::any();
+        let base: u32 = kani::any();
+        let spend: u32 = kani::any();
+        let per: u32 = kani::any();
+        kani::assume(budget <= BOUND && base <= BOUND && spend <= BOUND && per <= LAT);
+        kani::assert(
+            achievable_chains(budget, base.saturating_add(spend), per)
+                <= achievable_chains(budget, base, per),
+            "spending registers never raises the chains the file can sustain",
+        );
+    }
+
+    // `achievable_chains` is monotone non-decreasing in `reg_budget`.
+    #[kani::proof]
+    fn more_budget_never_lowers_achievable_chains() {
+        let b_lo: u32 = kani::any();
+        let b_hi: u32 = kani::any();
+        let base: u32 = kani::any();
+        let per: u32 = kani::any();
+        kani::assume(b_lo <= b_hi && b_hi <= BOUND && base <= BOUND && per <= LAT);
+        kani::assert(
+            achievable_chains(b_lo, base, per) <= achievable_chains(b_hi, base, per),
+            "more register budget never sustains fewer chains",
+        );
+    }
+
+    // `overlap_keeps_hidden` is monotone in `spend`: if a larger spend keeps the
+    // recurrence hidden, a smaller one does too (no false-safe cliff).
+    #[kani::proof]
+    fn overlap_hiding_is_monotone_in_spend() {
+        let op = OpTemplate {
+            chains: kani::any(),
+            depth: kani::any(),
+            cyc_per_op: kani::any(),
+            op_latency: kani::any(),
+        };
+        let budget: u32 = kani::any();
+        let base: u32 = kani::any();
+        let per: u32 = kani::any();
+        let s_lo: u32 = kani::any();
+        let s_hi: u32 = kani::any();
+        kani::assume(op.chains <= CHAIN_N && op.depth <= CHAIN_N);
+        kani::assume(op.cyc_per_op >= 1 && op.cyc_per_op <= LAT && op.op_latency <= LAT);
+        kani::assume(budget <= BOUND && base <= BOUND && per <= LAT);
+        kani::assume(s_lo <= s_hi && s_hi <= BOUND);
+        if op.overlap_keeps_hidden(budget, base, per, s_hi) {
+            kani::assert(
+                op.overlap_keeps_hidden(budget, base, per, s_lo),
+                "a smaller register spend can only keep the leg more hidden",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod register_coupling_tests {
+    use super::*;
+
+    #[test]
+    fn achievable_chains_arithmetic() {
+        assert_eq!(achievable_chains(170, 87, 8), 10); // (170-87)/8
+        assert_eq!(achievable_chains(87, 87, 8), 0); // no headroom
+        assert_eq!(achievable_chains(50, 87, 8), 0); // base > budget (saturating)
+        assert_eq!(achievable_chains(100, 0, 0), 100); // regs_per_chain clamped to 1
+    }
+
+    // The register-prefetch regression as a worked case: a spend that fits the
+    // occupancy budget can still starve the compute leg's chains and re-expose the
+    // recurrence — the cost the isolated max(load, compute) projection missed.
+    #[test]
+    fn register_spend_reexposes_latency() {
+        // FATTN QK compute leg after depth-reduction: 7 chains hide the 14-cyc HMMA
+        // latency at 2 cyc/op, so it runs at 100% utilization.
+        let qk = OpTemplate { chains: 7, depth: 64, cyc_per_op: 2, op_latency: 14 };
+        assert_eq!(qk.chains_to_hide(), 7);
+        assert_eq!(qk.utilization_pct(), 100);
+        // A budget that just fits the 7 chains (4 regs/chain over a 100-reg base):
+        // all sustained, fully hidden.
+        let (budget, base, per) = (128, 100, 4);
+        assert_eq!(achievable_chains(budget, base, per), 7);
+        assert!(qk.overlap_keeps_hidden(budget, base, per, 0));
+        assert_eq!(qk.utilization_under_registers(budget, base, per), 100);
+        // Spend 12 registers on an overlap buffer -> only 4 chains sustained -> the
+        // recurrence re-exposes: keeps_hidden is false and utilization falls to 57%
+        // (a ~1.75x leg slowdown). The spend still co-resides — occupancy-OK, ILP-not.
+        assert!(!qk.overlap_keeps_hidden(budget, base, per, 12));
+        assert_eq!(qk.utilization_under_registers(budget, base + 12, per), 57);
+    }
+
+    #[test]
+    fn spend_within_headroom_stays_hidden() {
+        let qk = OpTemplate { chains: 7, depth: 64, cyc_per_op: 2, op_latency: 14 };
+        // 160-reg budget over a 100-reg base sustains 15 chains: a 12-reg spend leaves
+        // 12 >= 7, still hidden, and the clamp keeps all 7 requested chains at 100%.
+        assert!(qk.overlap_keeps_hidden(160, 100, 4, 12));
+        assert_eq!(qk.utilization_under_registers(160, 100, 4), 100);
     }
 }
 

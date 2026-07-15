@@ -13,7 +13,7 @@ use calx_mill::nvidia::sass::{census_csv, census_per_kernel, sass_text};
 use calx_mill::nvidia::table::Rates;
 use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
-use calx_mill::{Bottleneck, OpTemplate};
+use calx_mill::{achievable_chains, Bottleneck, OpTemplate};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -46,10 +46,14 @@ commands:
   ncu <export.csv>
       parse an `ncu --csv` metric export; achieved occupancy per launch
   latency --chains C --depth D --cyc-per-op R --op-latency L
+          [--reg-budget B --base-regs BR --regs-per-chain RC --spend S]
       the dependency-latency projection MII = max(C*D*R, D*L) (call/0028):
       cycles, bottleneck, utilization (Little's Law C*R/L), and the L/R hide
       threshold. e.g. the FATTN QK chain: --chains 4 --depth 64 --cyc-per-op 2
-      --op-latency 14 -> latency-bound, 57% (7 chains to hide)
+      --op-latency 14 -> latency-bound, 57% (7 chains to hide).
+      With --reg-budget, also derives the chains the register file sustains
+      ((B-BR)/RC) and, with --spend, whether an overlap lever spending S
+      registers keeps the recurrence hidden or re-exposes it (call/0031).
 
 kernel PAT is the subset the tools use: literals, '.', '\\d', with '*'/'+'.
 Binaries are disassembled via cuobjdump (override with CUOBJDUMP); .sass
@@ -335,7 +339,19 @@ fn run() -> Result<i32, String> {
         }
         "latency" => {
             // MII = max(ResMII, RecMII): the dependency-latency projection (call/0028).
-            let args = Args::parse(rest, &["chains", "depth", "cyc-per-op", "op-latency"])?;
+            let args = Args::parse(
+                rest,
+                &[
+                    "chains",
+                    "depth",
+                    "cyc-per-op",
+                    "op-latency",
+                    "reg-budget",
+                    "base-regs",
+                    "regs-per-chain",
+                    "spend",
+                ],
+            )?;
             let t = OpTemplate {
                 chains: args.number("chains", 1u32)?,
                 depth: args.number("depth", 1u32)?,
@@ -358,6 +374,34 @@ fn run() -> Result<i32, String> {
                 t.chains_to_hide(),
                 t.chains,
             );
+            // Register->chains coupling (call/0031): with a budget, report the chains
+            // the file sustains and whether an overlap `spend` keeps the recurrence hidden.
+            let budget = args.number("reg-budget", 0u32)?;
+            if budget > 0 {
+                let base = args.number("base-regs", 0u32)?;
+                let per = args.number("regs-per-chain", 1u32)?;
+                let spend = args.number("spend", 0u32)?;
+                let ach = achievable_chains(budget, base, per);
+                println!(
+                    "registers: budget {} - base {} @ {}/chain -> sustains {} chains (requested {})",
+                    budget, base, per, ach, t.chains,
+                );
+                println!(
+                    "under registers: utilization {}%",
+                    t.utilization_under_registers(budget, base, per),
+                );
+                if spend > 0 {
+                    let keeps = t.overlap_keeps_hidden(budget, base, per, spend);
+                    let after = achievable_chains(budget, base.saturating_add(spend), per);
+                    println!(
+                        "overlap spend {}: sustains {} chains -> {} (hide threshold {})",
+                        spend,
+                        after,
+                        if keeps { "STAYS HIDDEN" } else { "RE-EXPOSES LATENCY" },
+                        t.chains_to_hide(),
+                    );
+                }
+            }
             Ok(0)
         }
         "--help" | "-h" | "help" => {
