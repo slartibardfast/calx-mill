@@ -189,6 +189,9 @@ pub enum Bottleneck {
     IssueCap,
     /// The memory byte budget.
     Memory,
+    /// The dependency-latency (recurrence) critical path: a chain is
+    /// under-parallelized, so `depth * op_latency` exceeds the throughput term.
+    Latency,
 }
 
 /// A steady-state throughput projection: predicted cycles and the binding resource.
@@ -348,6 +351,128 @@ pub fn project_mix(
         total_ops,
         issue_cap,
     ))
+}
+
+// ---------------------------------------------------------------- latency / ILP
+//
+// The dimension the throughput core lacked: dependency-limited (latency-bound)
+// execution. The initiation-interval bound of modulo scheduling (Rau 1994; Lam
+// 1988; survey Allan et al. 1995) is `MII = max(ResMII, RecMII)` — the resource/
+// throughput term the core already models (`project`) vs the recurrence/latency
+// term this adds. Little's Law (Little 1961) fixes when the recurrence is hidden:
+// the independent in-flight work must reach `latency / (cycles-per-op)`.
+//
+// UNITS: `cyc_per_op` is R, the reciprocal throughput (cycles/op) — sub-1 op/cycle
+// rates (a Turing HMMA issues one per 2 cycles) are integer here where an ops/cycle
+// rate would round to zero. `op_latency` is L, cycles from issue to result. A
+// chain of `depth` D dependent ops has critical path `D*L` regardless of how many
+// such chains run — they overlap under it; the chain COUNT enters only through the
+// throughput term (total ops). So `cycles = max(C*D*R, D*L)`, and utilization
+// `= C*R/L` capped at 1: full only at `C >= L/R` (7 independent HMMA chains on
+// TU102: L/R = 14/2). This is calx-mill's model of the plan/0143 FATTN result.
+
+/// A dependency chain: `depth` dependent ops on the critical path, each
+/// `op_latency` cycles issue->result. The recurrence (RecMII) term.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DepChain {
+    pub depth: u32,
+    pub op_latency: u32,
+}
+
+impl DepChain {
+    /// The recurrence floor `depth * op_latency`: one chain's critical path,
+    /// independent of how many chains run. Saturating (no overflow/panic).
+    pub fn latency_floor(&self) -> u32 {
+        self.depth.saturating_mul(self.op_latency)
+    }
+}
+
+/// Compose a throughput projection with a dependency-latency floor: the
+/// initiation-interval bound `max(ResMII, RecMII)`. `throughput` is the resource
+/// term (from `project`/`project_mix`); `chain` gives the recurrence term. Returns
+/// the slower. REDUCTION: when the chain is hidden (`latency_floor <= throughput`)
+/// the throughput projection is returned UNCHANGED — no regression on
+/// throughput-bound work (the Kani `latency_reduces_to_throughput_when_hidden`).
+pub fn project_latency(throughput: Projection, chain: &DepChain) -> Projection {
+    let floor = chain.latency_floor();
+    if floor > throughput.cycles {
+        Projection { cycles: floor, bottleneck: Bottleneck::Latency }
+    } else {
+        throughput
+    }
+}
+
+/// The MII bound for `chains` independent dependency chains, each of depth `depth`,
+/// on a pipe of reciprocal-throughput `cyc_per_op` (R, cycles/op) and per-op
+/// `op_latency` (L). ResMII = `chains*depth*R` (all ops through the one pipe);
+/// RecMII = `depth*L` (one chain's path). `cycles = max(ResMII, RecMII)`.
+/// Saturating throughout.
+pub fn chain_cycles(chains: u32, depth: u32, cyc_per_op: u32, op_latency: u32) -> Projection {
+    let total_ops = chains.saturating_mul(depth);
+    let throughput = Projection {
+        cycles: total_ops.saturating_mul(cyc_per_op),
+        bottleneck: Bottleneck::Pipe(0),
+    };
+    project_latency(throughput, &DepChain { depth, op_latency })
+}
+
+/// Utilization percent: `ResMII / MII` = the fraction of peak throughput reached.
+/// Little's Law as a fraction: `min(1, C*R/L)` — 100% only when the chain is
+/// hidden (`C >= L/R`). Reproduces the plan/0143 FATTN QK figure: (4,64,2,14) -> 57.
+pub fn chain_utilization_pct(chains: u32, depth: u32, cyc_per_op: u32, op_latency: u32) -> u32 {
+    let throughput = chains
+        .saturating_mul(depth)
+        .saturating_mul(cyc_per_op) as u64;
+    let mii = chain_cycles(chains, depth, cyc_per_op, op_latency).cycles.max(1) as u64;
+    ((throughput * 100) / mii) as u32
+}
+
+/// ADVISORY (compiler-dependent, deliberately NOT a Kani lower-bound proof): the
+/// live register demand a hot loop inflates to when the compiler software-pipelines
+/// `unroll` iterations, each carrying `per_iter_live` registers across the overlap
+/// on top of the loop-invariant `base`. ONE-WAY CONSERVATIVE by construction: it may
+/// only OVER-estimate — `base + unroll*per_iter_live`, the worst case where no
+/// iteration's registers free before the next issues — so it can predict "won't
+/// co-reside" wrongly but never "will co-reside" wrongly (a false "fits" launches a
+/// kernel that then won't). Feed the result to `concurrency`/`blocks_per_instance`
+/// so the co-residency verdict is available BEFORE ptxas runs. The proof obligation
+/// (`unroll_registers_never_lowers_the_estimate`) is only that it is monotone
+/// non-decreasing in `unroll` — more unroll never PREDICTS more co-residency.
+pub fn unrolled_registers(base: u32, unroll: u32, per_iter_live: u32) -> u32 {
+    base.saturating_add(unroll.saturating_mul(per_iter_live))
+}
+
+/// A composed op template: a dependency-structured op reduced to its latency-model
+/// inputs — `chains` independent chains, each `depth` dependent ops, on a pipe of
+/// reciprocal-throughput `cyc_per_op` and per-op `op_latency`. The convenience
+/// layer (call/0028): build the inputs once per op family, project in one call.
+/// Falsified by BREADTH, not by one family — a single flash-attention template
+/// overfits (FA chains are latency-hideable, so it learns "always hideable"); the
+/// breadth gate drives it across distinct structures, incl. a recurrence at
+/// `chains == 1` that MUST stay latency-bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OpTemplate {
+    pub chains: u32,
+    pub depth: u32,
+    pub cyc_per_op: u32,
+    pub op_latency: u32,
+}
+
+impl OpTemplate {
+    pub fn cycles(&self) -> Projection {
+        chain_cycles(self.chains, self.depth, self.cyc_per_op, self.op_latency)
+    }
+    pub fn utilization_pct(&self) -> u32 {
+        chain_utilization_pct(self.chains, self.depth, self.cyc_per_op, self.op_latency)
+    }
+    pub fn latency_bound(&self) -> bool {
+        self.cycles().bottleneck == Bottleneck::Latency
+    }
+    /// The hide threshold in independent chains: `ceil(op_latency / cyc_per_op)` =
+    /// L/R (Little's Law). At or above it the recurrence is hidden.
+    pub fn chains_to_hide(&self) -> u32 {
+        ceil_div(self.op_latency, self.cyc_per_op.max(1))
+    }
 }
 
 pub mod nvidia;
@@ -647,6 +772,111 @@ mod proofs {
             "grid == instances iff one block fits per instance",
         );
     }
+
+    // ---- latency / ILP dimension (call/0028) ----
+    // MII = max(ResMII, RecMII): the recurrence floor `depth*op_latency` composed
+    // with the throughput term. depth*op_latency and chains*depth*cyc_per_op are
+    // u32 products, so bound the multiplicands to a fragment/chain scale (CBMC
+    // stays tractable, 0/1/boundary edges still hit).
+    const CHAIN_N: u32 = 24; // chains / depth scale (proof-only; theorems are structural,
+    const LAT: u32 = 16; // op-latency / cyc-per-op scale — a small bound keeps CBMC's
+                         // multiplication reasoning (chains*depth, depth*latency) tractable
+                         // while still hitting 0/1/boundary and the C>=L/R threshold cases.
+
+    // (a) Reduction: when the chain is hidden (recurrence floor <= throughput), the
+    // latency projection is EXACTLY the throughput projection — no regression on
+    // throughput-bound work (MII collapses to ResMII == the core's PPM).
+    #[kani::proof]
+    fn latency_reduces_to_throughput_when_hidden() {
+        let t_cycles: u32 = kani::any();
+        let t_bind: usize = kani::any();
+        let depth: u32 = kani::any();
+        let op_latency: u32 = kani::any();
+        kani::assume(t_cycles <= BOUND && t_bind < 8 && depth <= CHAIN_N && op_latency <= LAT);
+        let chain = DepChain { depth, op_latency };
+        kani::assume(chain.latency_floor() <= t_cycles); // hidden
+        let thr = Projection { cycles: t_cycles, bottleneck: Bottleneck::Pipe(t_bind) };
+        kani::assert(
+            project_latency(thr, &chain) == thr,
+            "hidden chain => projection unchanged (== PPM)",
+        );
+    }
+
+    // (b) The projection is the max of both terms: never below either bound (a
+    // correct MII lower bound); saturating (Kani also checks no panic/overflow).
+    #[kani::proof]
+    fn latency_is_the_max_of_both_bounds() {
+        let t_cycles: u32 = kani::any();
+        let depth: u32 = kani::any();
+        let op_latency: u32 = kani::any();
+        kani::assume(t_cycles <= BOUND && depth <= CHAIN_N && op_latency <= LAT);
+        let chain = DepChain { depth, op_latency };
+        let thr = Projection { cycles: t_cycles, bottleneck: Bottleneck::Pipe(0) };
+        let out = project_latency(thr, &chain).cycles;
+        kani::assert(out >= t_cycles, "never below the throughput (ResMII) term");
+        kani::assert(out >= chain.latency_floor(), "never below the recurrence (RecMII) term");
+    }
+
+    // (c) Monotone in depth (at fixed chains/rate/latency): a deeper dependency
+    // chain is never faster — deepening a recurrence cannot lower cycles.
+    #[kani::proof]
+    fn latency_monotone_in_depth() {
+        let chains: u32 = kani::any();
+        let d_lo: u32 = kani::any();
+        let d_hi: u32 = kani::any();
+        let r: u32 = kani::any();
+        let l: u32 = kani::any();
+        kani::assume(chains <= CHAIN_N && d_lo <= d_hi && d_hi <= CHAIN_N && r <= LAT && l <= LAT);
+        let lo = chain_cycles(chains, d_lo, r, l).cycles;
+        let hi = chain_cycles(chains, d_hi, r, l).cycles;
+        kani::assert(lo <= hi, "deeper chain (fixed chains) => never faster");
+    }
+
+    // (d) Monotone in chains AT FIXED TOTAL WORK — the load-bearing statement (the
+    // interleave / depth-reduction lever): with C1*D1 == C2*D2 and D1 >= D2, the
+    // throughput term is identical (same total ops) and the recurrence floor D*L is
+    // non-increasing, so more/shorter chains never raise cycles. Stated at fixed
+    // work because with C,D free "more chains" adds work (the naive form is false).
+    #[kani::proof]
+    fn latency_monotone_in_chains_at_fixed_work() {
+        let c1: u32 = kani::any();
+        let d1: u32 = kani::any();
+        let c2: u32 = kani::any();
+        let d2: u32 = kani::any();
+        let r: u32 = kani::any();
+        let l: u32 = kani::any();
+        kani::assume(
+            c1 <= CHAIN_N && d1 <= CHAIN_N && c2 <= CHAIN_N && d2 <= CHAIN_N && r <= LAT && l <= LAT,
+        );
+        kani::assume(c1.saturating_mul(d1) == c2.saturating_mul(d2)); // same total work W
+        kani::assume(d1 >= d2); // fewer/deeper (c1) vs more/shallower (c2)
+        let fewer_deeper = chain_cycles(c1, d1, r, l).cycles;
+        let more_shallow = chain_cycles(c2, d2, r, l).cycles;
+        kani::assert(
+            more_shallow <= fewer_deeper,
+            "more, shorter chains at fixed work => never slower",
+        );
+    }
+
+    // (e) The unroll->register advisory is one-way conservative: monotone
+    // NON-DECREASING in unroll, so more unroll never predicts FEWER registers, and
+    // (composing with `fewer_registers_never_lowers_concurrency`) never predicts
+    // MORE co-residency — a false "fits" is the dangerous direction. This is the
+    // ONLY property proven of the advisory; it is not a lower bound on the real
+    // (compiler-chosen) register count.
+    #[kani::proof]
+    fn unroll_registers_never_lowers_the_estimate() {
+        let base: u32 = kani::any();
+        let u_lo: u32 = kani::any();
+        let u_hi: u32 = kani::any();
+        let per: u32 = kani::any();
+        kani::assume(base <= BOUND && u_lo <= u_hi && u_hi <= CHAIN_N && per <= LAT);
+        kani::assert(
+            unrolled_registers(base, u_lo, per) <= unrolled_registers(base, u_hi, per),
+            "more unroll => never fewer registers (never falsely promises co-residency)",
+        );
+        kani::assert(unrolled_registers(base, u_lo, per) >= base, "estimate >= base");
+    }
 }
 
 #[cfg(test)]
@@ -684,4 +914,135 @@ mod precision_tests {
         let w32 = WorkUnit { registers: acc_registers(40, 8, &fp32) * 32, local_store_bytes: 0 };
         assert!(concurrency(&s, &w16) >= concurrency(&s, &w32));
     }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+
+    // Reproduce the plan/0143 FATTN result from the TU102 paper's constants (HMMA:
+    // R = 2 cyc/op, L = 14 cyc). QK is NT = 4 independent position-tile chains, each
+    // depth 64 (both-split: 2 HMMAs x 32 ks-steps). C = 4 < L/R = 7 -> latency-bound.
+    #[test]
+    fn fattn_qk_is_latency_bound_at_four_chains() {
+        let p = chain_cycles(4, 64, 2, 14);
+        assert_eq!(p.cycles, 896); // max(ResMII 4*64*2=512, RecMII 64*14=896) = 896
+        assert_eq!(p.bottleneck, Bottleneck::Latency);
+        assert_eq!(chain_utilization_pct(4, 64, 2, 14), 57); // 512/896: the measured ~57%
+    }
+
+    // The hide threshold C >= L/R = 7: at 7 chains the throughput term catches the
+    // recurrence floor (100% util, throughput-bound); below it, latency-bound.
+    #[test]
+    fn hmma_hides_at_seven_chains() {
+        assert_eq!(chain_utilization_pct(6, 64, 2, 14), 85); // 768/896, still latency-bound
+        assert_eq!(chain_cycles(6, 64, 2, 14).bottleneck, Bottleneck::Latency);
+        assert_eq!(chain_utilization_pct(7, 64, 2, 14), 100); // 896/896: hidden
+        assert_eq!(chain_cycles(7, 64, 2, 14).bottleneck, Bottleneck::Pipe(0));
+        assert_eq!(chain_cycles(8, 64, 2, 14).bottleneck, Bottleneck::Pipe(0)); // throughput-bound
+    }
+
+    // The depth-reduction / interleave lever at FIXED WORK W = 256 ops (the plan/0143
+    // "P.V G>=7 / QK partial-sum" prediction): splitting one depth-64 chain into more,
+    // shorter chains crosses the threshold and reaches the throughput floor.
+    #[test]
+    fn splitting_fixed_work_reaches_the_throughput_floor() {
+        let deep = chain_cycles(4, 64, 2, 14); // fewer/deeper: latency-bound
+        let split = chain_cycles(8, 32, 2, 14); // more/shorter, SAME 256 ops
+        assert_eq!(deep.cycles, 896);
+        assert_eq!(split.cycles, 512); // max(512, 32*14=448) = 512, throughput-bound
+        assert_eq!(split.bottleneck, Bottleneck::Pipe(0));
+        assert!(split.cycles < deep.cycles); // the win the latency model predicts
+    }
+}
+
+#[cfg(test)]
+mod overfit_gate_latency {
+    use super::*;
+    // The latency model must predict a dependency case on EACH substrate, or it
+    // overfit TU102. (R = cyc/op, L = latency; same time-unit within a case.)
+
+    // TU102 HMMA: R=2, L=14 (PAPER.md tab:tensor). One accumulator (C=1) deeply
+    // latency-bound; hidden only at C >= L/R = 7.
+    #[test]
+    fn tu102_hmma_dependency_chain() {
+        let t = OpTemplate { chains: 1, depth: 32, cyc_per_op: 2, op_latency: 14 };
+        assert!(t.latency_bound());
+        assert_eq!(t.chains_to_hide(), 7);
+    }
+    // AVX-512 FMA: 4-cyc latency, 2 FMA ports (~2/cyc) -> R=0.5; integer half-cycle
+    // units R=1,L=8 keep the ratio. Textbook "8 accumulators saturate AVX FMA".
+    #[test]
+    fn avx512_fma_dependency_chain() {
+        let t = OpTemplate { chains: 1, depth: 64, cyc_per_op: 1, op_latency: 8 };
+        assert!(t.latency_bound());
+        assert_eq!(t.chains_to_hide(), 8);
+    }
+    // ARM SME ZA outer-product-accumulate: same tile-accumulate chain as HMMA, a
+    // different vendor's matrix engine -> the same model. Constants illustrative,
+    // to be pinned from the SME microbench characterizations (Hello SME!/Demystify).
+    #[test]
+    fn arm_sme_za_dependency_chain() {
+        let t = OpTemplate { chains: 1, depth: 32, cyc_per_op: 1, op_latency: 6 };
+        assert!(t.latency_bound());
+        assert_eq!(t.chains_to_hide(), 6);
+    }
+    // 8088 EU: unpipelined -> issue-to-issue == latency (R == L) and NO ILP (C is
+    // structurally 1). The model reports fully serial (util 100%, no hiding
+    // headroom): it does NOT falsely promise hiding where there is no ILP.
+    #[test]
+    fn i8088_unpipelined_chain_has_no_ilp() {
+        let t = OpTemplate { chains: 1, depth: 8, cyc_per_op: 118, op_latency: 118 };
+        assert_eq!(t.cycles().cycles, 8 * 118); // serial
+        assert_eq!(t.utilization_pct(), 100);
+        assert_eq!(t.chains_to_hide(), 1);
+    }
+}
+
+#[cfg(test)]
+mod op_templates_breadth {
+    use super::*;
+    // Falsify the template layer by BREADTH across distinct latency structures; a
+    // single flash-attention template would overfit ("always hideable").
+
+    // (1) FA-decode QK: NT=4 hideable chains, depth 64. Latency-bound at C=4 (<7);
+    // splitting fixed work to C>=7 reaches the throughput floor.
+    #[test]
+    fn fa_decode_hideable() {
+        let t = OpTemplate { chains: 4, depth: 64, cyc_per_op: 2, op_latency: 14 };
+        assert!(t.latency_bound());
+        assert_eq!(t.utilization_pct(), 57);
+        let hidden = OpTemplate { chains: 8, depth: 32, cyc_per_op: 2, op_latency: 14 };
+        assert!(!hidden.latency_bound());
+    }
+    // (2) DeltaNet/GDN recurrence -- THE anti-overfit case: each step depends on the
+    // prior state, so independent chains = 1 by data dependency. MUST stay
+    // latency-bound and MUST NOT be reported hideable. Chunk-parallel scan raises C
+    // to the CHUNK COUNT (a ceiling), never to one-chain-per-step.
+    #[test]
+    fn deltanet_recurrence_stays_latency_bound() {
+        let seq = OpTemplate { chains: 1, depth: 128, cyc_per_op: 1, op_latency: 8 };
+        assert!(seq.latency_bound()); // C=1: maximally latency-bound
+        assert_eq!(seq.utilization_pct(), 12); // 128/(128*8)
+        let chunked = OpTemplate { chains: 8, depth: 16, cyc_per_op: 1, op_latency: 8 };
+        assert!(!chunked.latency_bound()); // C=8=L/R hidden -- but the chunk ceiling
+    }
+    // (3) MMVQ dp4a GEMV tail: CUDA-core pipe (not tensor), ILP from output columns.
+    #[test]
+    fn mmvq_dp4a_tail() {
+        let one = OpTemplate { chains: 1, depth: 32, cyc_per_op: 1, op_latency: 6 };
+        assert!(one.latency_bound());
+        let many = OpTemplate { chains: 6, depth: 32, cyc_per_op: 1, op_latency: 6 };
+        assert!(!many.latency_bound()); // 6 columns hide the 6-cyc dp4a latency
+    }
+    // (4) Cross-GPU XCHG/NVLink: interconnect latency, few in-flight messages -- a
+    // different RESOURCE than compute, same model. Constants illustrative.
+    #[test]
+    fn xchg_nvlink_latency_bound() {
+        let t = OpTemplate { chains: 2, depth: 4, cyc_per_op: 10, op_latency: 400 };
+        assert!(t.latency_bound()); // 4*400 >> 2*4*10
+    }
+    // (5) cross-substrate is covered by overfit_gate_latency (AVX-512, 8088). Five
+    // distinct structures through ONE primitive (OpTemplate/chain_cycles): if any
+    // could not be expressed, the layer leaked.
 }

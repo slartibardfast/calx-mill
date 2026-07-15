@@ -13,6 +13,7 @@ use calx_mill::nvidia::sass::{census_csv, census_per_kernel, sass_text};
 use calx_mill::nvidia::table::Rates;
 use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
+use calx_mill::{Bottleneck, OpTemplate};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -44,6 +45,11 @@ commands:
       SMs; --block-smem overrides static smem with the dynamic launch value)
   ncu <export.csv>
       parse an `ncu --csv` metric export; achieved occupancy per launch
+  latency --chains C --depth D --cyc-per-op R --op-latency L
+      the dependency-latency projection MII = max(C*D*R, D*L) (call/0028):
+      cycles, bottleneck, utilization (Little's Law C*R/L), and the L/R hide
+      threshold. e.g. the FATTN QK chain: --chains 4 --depth 64 --cyc-per-op 2
+      --op-latency 14 -> latency-bound, 57% (7 chains to hide)
 
 kernel PAT is the subset the tools use: literals, '.', '\\d', with '*'/'+'.
 Binaries are disassembled via cuobjdump (override with CUOBJDUMP); .sass
@@ -325,6 +331,33 @@ fn run() -> Result<i32, String> {
             for (launch, kernel, pct) in achieved_occupancy(&rows) {
                 println!("achieved occupancy [{}] {}: {}%", launch, kernel, pct);
             }
+            Ok(0)
+        }
+        "latency" => {
+            // MII = max(ResMII, RecMII): the dependency-latency projection (call/0028).
+            let args = Args::parse(rest, &["chains", "depth", "cyc-per-op", "op-latency"])?;
+            let t = OpTemplate {
+                chains: args.number("chains", 1u32)?,
+                depth: args.number("depth", 1u32)?,
+                cyc_per_op: args.number("cyc-per-op", 1u32)?,
+                op_latency: args.number("op-latency", 1u32)?,
+            };
+            let res = t.chains.saturating_mul(t.depth).saturating_mul(t.cyc_per_op);
+            let rec = t.depth.saturating_mul(t.op_latency);
+            let p = t.cycles();
+            let bound = match p.bottleneck {
+                Bottleneck::Latency => "latency-bound (RecMII, under-parallelized)",
+                Bottleneck::Pipe(_) => "throughput-bound (ResMII)",
+                Bottleneck::IssueCap => "issue-bound",
+                Bottleneck::Memory => "memory-bound",
+            };
+            println!("MII = max(ResMII {}, RecMII {}) = {} cycles [{}]", res, rec, p.cycles, bound);
+            println!(
+                "utilization {}%; hidden at chains >= L/R = {} (have {})",
+                t.utilization_pct(),
+                t.chains_to_hide(),
+                t.chains,
+            );
             Ok(0)
         }
         "--help" | "-h" | "help" => {
