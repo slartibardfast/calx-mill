@@ -15,6 +15,7 @@ use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
 use calx_mill::{achievable_chains, Bottleneck, Lane, OpComposition, OpTemplate, Phase};
 use calx_mill::validity::{authority, verdict, Anchor, DomainFit, Verdict};
+use calx_mill::telemetry::{overlap_fraction, parse_tele, TeleRecord};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -520,6 +521,74 @@ fn run() -> Result<i32, String> {
                     Ok(2)   // non-zero: an unvalidated projection cannot be laundered into a pass
                 }
             }
+        }
+        "telemetry" => {
+            // plan/0144 primitive-telemetry ingest: read the megakernel's on-device
+            // .tele record and summarize the MEASURED anchors — per-op wall, the
+            // heavy hitters, and the realized overlap of adjacent lane-crossing pairs
+            // (the measurement no external profiler yields). bytes/ops==0 records show
+            // no MemoryBw/Pipe column yet (attached in a later pass), so the memory
+            // classification is reported only where bytes are present.
+            let path = rest.first().ok_or("telemetry: need a .tele file path")?;
+            let text = read(path)?;
+            let recs = parse_tele(&text);
+            if recs.is_empty() {
+                return Err(format!("{}: no telemetry records parsed", path));
+            }
+            let n_bad: usize = recs.iter().filter(|r| !r.roofline_ok()).count();
+            let n_bytes: usize = recs.iter().filter(|r| r.bytes > 0).count();
+            let sum_cyc: u64 = recs.iter().map(|r| r.cycles).sum();
+            let sum_span: u64 = recs.iter().map(|r| r.span_ns()).sum();
+            println!(
+                "telemetry: {} op records; Σcycles {} ({:.3} ms @1.455GHz); Σgt-span {:.3} ms; \
+                 {} with bytes; {} roofline-violating (T1 reject)",
+                recs.len(),
+                sum_cyc,
+                sum_cyc as f64 / 1.455e9 * 1e3,
+                sum_span as f64 / 1e6,
+                n_bytes,
+                n_bad
+            );
+            // Heavy hitters by measured wall.
+            let mut idx: Vec<usize> = (0..recs.len()).collect();
+            idx.sort_by(|&a, &b| recs[b].cycles.cmp(&recs[a].cycles));
+            println!("  top ops by measured wall (op_index kind lane cycles gt-ns):");
+            for &i in idx.iter().take(8) {
+                let r: &TeleRecord = &recs[i];
+                println!(
+                    "    {:>5} {:<16} {:<7} {:>10} {:>10}",
+                    r.op_index,
+                    r.kind,
+                    if r.lane == Lane::Memory { "mem" } else { "compute" },
+                    r.cycles,
+                    r.span_ns()
+                );
+            }
+            // Realized overlap of adjacent lane-crossing pairs (the T6 input): how much
+            // the schedule's consecutive mem/compute ops actually ran concurrently.
+            let mut pairs = 0usize;
+            let mut overlapped = 0usize;
+            let mut sum_ov = 0.0f64;
+            for w in recs.windows(2) {
+                if w[0].lane != w[1].lane {
+                    let o = overlap_fraction(&w[0], &w[1]);
+                    pairs += 1;
+                    sum_ov += o;
+                    if o > 0.05 {
+                        overlapped += 1;
+                    }
+                }
+            }
+            if pairs > 0 {
+                println!(
+                    "  adjacent lane-crossing pairs: {}; realized-overlap mean {:.3}, {} with >5% overlap \
+                     (measured concurrency for overlapped_contended / T6)",
+                    pairs,
+                    sum_ov / pairs as f64,
+                    overlapped
+                );
+            }
+            Ok(0)
         }
         "--help" | "-h" | "help" => {
             println!("{}", USAGE);

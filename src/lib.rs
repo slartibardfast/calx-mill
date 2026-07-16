@@ -724,6 +724,7 @@ pub fn overlapped_contended(
 }
 
 pub mod nvidia;
+pub mod telemetry;
 pub mod validity;
 
 #[cfg(kani)]
