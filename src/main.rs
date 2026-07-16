@@ -13,7 +13,7 @@ use calx_mill::nvidia::sass::{census_csv, census_per_kernel, sass_text};
 use calx_mill::nvidia::table::Rates;
 use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
-use calx_mill::{achievable_chains, Bottleneck, OpTemplate};
+use calx_mill::{achievable_chains, Bottleneck, Lane, OpComposition, OpTemplate, Phase};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -54,6 +54,16 @@ commands:
       With --reg-budget, also derives the chains the register file sustains
       ((B-BR)/RC) and, with --spend, whether an overlap lever spending S
       registers keeps the recurrence hidden or re-exposes it (call/0031).
+
+  compose --mem-cycles M --compute-cycles C
+          [--chains .. --depth .. --cyc-per-op .. --op-latency ..
+           --reg-budget B --base-regs BR --regs-per-chain RC --spend S]
+      whole-op phase composition (call/0033): serial = M+C (today's serial
+      kernel) vs overlapped = max(M,C) (the double-buffer floor). With
+      --reg-budget, gates the overlap on the compute lane keeping its ILP after
+      the --spend registers: a smem double-buffer (spend 0) earns the floor, a
+      register-prefetch (spend > headroom) falls back to serial. e.g. FATTN deep:
+      --mem-cycles 1413 --compute-cycles 1945 -> serial 3358, overlapped 1945.
 
 kernel PAT is the subset the tools use: literals, '.', '\\d', with '*'/'+'.
 Binaries are disassembled via cuobjdump (override with CUOBJDUMP); .sass
@@ -401,6 +411,61 @@ fn run() -> Result<i32, String> {
                         t.chains_to_hide(),
                     );
                 }
+            }
+            Ok(0)
+        }
+        "compose" => {
+            // Whole-op phase composition (call/0033): serial sum vs the two-lane
+            // double-buffer overlap floor, gated on the compute lane keeping its ILP.
+            let args = Args::parse(
+                rest,
+                &[
+                    "mem-cycles",
+                    "compute-cycles",
+                    "chains",
+                    "depth",
+                    "cyc-per-op",
+                    "op-latency",
+                    "reg-budget",
+                    "base-regs",
+                    "regs-per-chain",
+                    "spend",
+                ],
+            )?;
+            let mem = args.number("mem-cycles", 0u32)?;
+            let cmp = args.number("compute-cycles", 0u32)?;
+            let phases = [
+                Phase { cycles: mem, lane: Lane::Memory },
+                Phase { cycles: cmp, lane: Lane::Compute },
+            ];
+            let comp = OpComposition { phases: &phases };
+            println!(
+                "serial = mem {} + compute {} = {} cycles (no overlap; today's kernel)",
+                mem, cmp, comp.serial_cycles(),
+            );
+            println!(
+                "overlapped = max(mem {}, compute {}) = {} cycles (perfect double-buffer floor)",
+                mem, cmp, comp.overlapped_cycles(),
+            );
+            // The compute lane's register gate decides whether the overlap is real.
+            let budget = args.number("reg-budget", 0u32)?;
+            if budget > 0 {
+                let t = OpTemplate {
+                    chains: args.number("chains", 1u32)?,
+                    depth: args.number("depth", 1u32)?,
+                    cyc_per_op: args.number("cyc-per-op", 1u32)?,
+                    op_latency: args.number("op-latency", 1u32)?,
+                };
+                let base = args.number("base-regs", 0u32)?;
+                let per = args.number("regs-per-chain", 1u32)?;
+                let spend = args.number("spend", 0u32)?;
+                let creditable = t.overlap_keeps_hidden(budget, base, per, spend);
+                println!(
+                    "register gate: overlap spend {} -> compute lane {} -> projection {} cycles",
+                    spend,
+                    if creditable { "STAYS HIDDEN (creditable)" } else { "RE-EXPOSES (not creditable)" },
+                    comp.overlapped_if(creditable),
+                );
             }
             Ok(0)
         }

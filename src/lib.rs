@@ -557,6 +557,117 @@ impl OpTemplate {
     }
 }
 
+/// Which lane a [`Phase`] runs on. A multi-phase op interleaves memory-bound tile
+/// loads and compute-bound math; a double-buffer overlaps the two lanes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Memory,
+    Compute,
+}
+
+/// One phase of a multi-phase op, reduced to a cycle cost and its lane. Ops like
+/// the megakernel FATTN decode are NOT one dependency chain: they interleave
+/// memory phases (K/V tile loads) with compute phases (QK, PV HMMA), serialized
+/// by barriers. The single-chain [`OpTemplate`] mispredicts such an op's wall
+/// time (call/0032, the three overnight FATTN regressions that were each
+/// single-chain-green yet regressed). Build a phase per barrier-separated stage;
+/// an [`OpComposition`] then projects the serial sum and the double-buffer floor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Phase {
+    pub cycles: u32,
+    pub lane: Lane,
+}
+
+impl Phase {
+    /// A compute phase whose cost is an [`OpTemplate`]'s MII.
+    pub fn compute(t: OpTemplate) -> Phase {
+        Phase { cycles: t.cycles().cycles, lane: Lane::Compute }
+    }
+    /// A memory phase whose cost the caller derives from `bytes / bandwidth`
+    /// (e.g. via [`project`] or `stream_bytes` over the substrate's `mem_bandwidth`).
+    pub fn memory(cycles: u32) -> Phase {
+        Phase { cycles, lane: Lane::Memory }
+    }
+}
+
+/// A multi-phase op as an ordered list of barrier-separated [`Phase`]s. The
+/// composition the single-chain model lacks (call/0032): it sums the phases the
+/// hardware runs serially today, and projects the floor a two-lane double-buffer
+/// reaches by overlapping the memory lane under the compute lane. It does the
+/// lane arithmetic only; the register feasibility of the overlap is the existing
+/// [`OpTemplate::overlap_keeps_hidden`] gate, wired in by [`Self::overlapped_if`]
+/// — a smem double-buffer spends no registers (creditable), a register-prefetch
+/// spends registers and may not be (the call/0031 trap that regressed the rig).
+#[derive(Clone, Copy, Debug)]
+pub struct OpComposition<'a> {
+    pub phases: &'a [Phase],
+}
+
+impl<'a> OpComposition<'a> {
+    /// Total cycles with no overlap: every phase runs in series (today's kernel).
+    ///
+    /// # Returns
+    /// The saturating sum of every phase's cycles.
+    pub fn serial_cycles(&self) -> u32 {
+        self.phases
+            .iter()
+            .fold(0u32, |acc, p| acc.saturating_add(p.cycles))
+    }
+
+    /// Cycles spent in one lane.
+    ///
+    /// # Arguments
+    /// * `lane` — [`Lane::Memory`] or [`Lane::Compute`].
+    ///
+    /// # Returns
+    /// The saturating sum of the cycles of phases on `lane`.
+    pub fn lane_cycles(&self, lane: Lane) -> u32 {
+        self.phases
+            .iter()
+            .filter(|p| p.lane == lane)
+            .fold(0u32, |acc, p| acc.saturating_add(p.cycles))
+    }
+
+    /// The pipelined floor a perfect two-lane double-buffer reaches: the memory
+    /// lane hides under the compute lane (or vice versa), so the op costs the
+    /// larger of the two lane sums rather than their sum.
+    ///
+    /// # Returns
+    /// `max(memory_lane_cycles, compute_lane_cycles)`.
+    pub fn overlapped_cycles(&self) -> u32 {
+        self.lane_cycles(Lane::Memory)
+            .max(self.lane_cycles(Lane::Compute))
+    }
+
+    /// The projection to trust, given whether the overlap is register-creditable.
+    ///
+    /// The load↔compute overlap only earns [`Self::overlapped_cycles`] if the
+    /// mechanism keeps the compute lane's ILP — a smem double-buffer does (spends
+    /// no registers), a register-prefetch may not. Compute `creditable` as the
+    /// AND over the compute phases' [`OpTemplate::overlap_keeps_hidden`] for the
+    /// overlap's register spend.
+    ///
+    /// # Arguments
+    /// * `creditable` — whether the overlap keeps every compute phase's recurrence
+    ///   hidden after its register spend.
+    ///
+    /// # Returns
+    /// [`Self::overlapped_cycles`] when `creditable`, else [`Self::serial_cycles`].
+    ///
+    /// # Guarantees
+    /// `overlapped_if(false) == serial_cycles() >= overlapped_cycles() ==
+    /// overlapped_if(true)`: a non-creditable overlap never yields an optimistic
+    /// number (proof `overlap_gate_never_optimistic`), so a register-spending
+    /// lever cannot be green-lit by the composition.
+    pub fn overlapped_if(&self, creditable: bool) -> u32 {
+        if creditable {
+            self.overlapped_cycles()
+        } else {
+            self.serial_cycles()
+        }
+    }
+}
+
 pub mod nvidia;
 
 #[cfg(kani)]
@@ -1016,6 +1127,56 @@ mod proofs {
             );
         }
     }
+
+    // OpComposition (call/0032): the two-lane overlap floor never falls below the
+    // larger lane and never rises above the serial sum. Bounds a 4-phase op so the
+    // saturating sums stay well inside u32.
+    #[kani::proof]
+    fn overlap_between_max_lane_and_serial() {
+        let c: [u32; 4] = [kani::any(), kani::any(), kani::any(), kani::any()];
+        let l: [bool; 4] = [kani::any(), kani::any(), kani::any(), kani::any()];
+        for i in 0..4 {
+            kani::assume(c[i] <= BOUND);
+        }
+        let phases = [
+            Phase { cycles: c[0], lane: if l[0] { Lane::Memory } else { Lane::Compute } },
+            Phase { cycles: c[1], lane: if l[1] { Lane::Memory } else { Lane::Compute } },
+            Phase { cycles: c[2], lane: if l[2] { Lane::Memory } else { Lane::Compute } },
+            Phase { cycles: c[3], lane: if l[3] { Lane::Memory } else { Lane::Compute } },
+        ];
+        let comp = OpComposition { phases: &phases };
+        let ov = comp.overlapped_cycles();
+        let ser = comp.serial_cycles();
+        let mem = comp.lane_cycles(Lane::Memory);
+        let cmp = comp.lane_cycles(Lane::Compute);
+        kani::assert(ov == mem.max(cmp), "overlap is the max of the two lanes");
+        kani::assert(ov <= ser, "overlap never exceeds the serial sum");
+        kani::assert(mem <= ser && cmp <= ser, "each lane is within the serial sum");
+    }
+
+    // The register gate never produces an optimistic number: a non-creditable
+    // overlap falls back to the serial sum, which is >= the overlapped floor.
+    #[kani::proof]
+    fn overlap_gate_never_optimistic() {
+        let c: [u32; 3] = [kani::any(), kani::any(), kani::any()];
+        for i in 0..3 {
+            kani::assume(c[i] <= BOUND);
+        }
+        let phases = [
+            Phase { cycles: c[0], lane: Lane::Memory },
+            Phase { cycles: c[1], lane: Lane::Compute },
+            Phase { cycles: c[2], lane: Lane::Memory },
+        ];
+        let comp = OpComposition { phases: &phases };
+        kani::assert(
+            comp.overlapped_if(false) == comp.serial_cycles(),
+            "a non-creditable overlap yields the serial sum",
+        );
+        kani::assert(
+            comp.overlapped_if(false) >= comp.overlapped_if(true),
+            "gating off never yields a smaller (optimistic) projection",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1229,4 +1390,73 @@ mod op_templates_breadth {
     // (5) cross-substrate is covered by overfit_gate_latency (AVX-512, 8088). Five
     // distinct structures through ONE primitive (OpTemplate/chain_cycles): if any
     // could not be expressed, the layer leaked.
+}
+
+#[cfg(test)]
+mod op_composition_tests {
+    use super::*;
+
+    // Validation against the measured FATTN_DECODE sub-phase profile (plan/0143,
+    // capture/fattn-phase-profile.txt, deep 256K dual-GPU). Phase cycles are the
+    // measured per-op times in centi-milliseconds (0.01 ms units); the model is
+    // unit-agnostic, so the ratios are what matter. Memory lane = K+V loads;
+    // compute lane = QK + softmax + PV + setup.
+    fn fattn_phases() -> [Phase; 6] {
+        [
+            Phase::memory(758),  // KLOAD   7.58 ms
+            Phase::compute(OpTemplate { chains: 1, depth: 1055, cyc_per_op: 1, op_latency: 1 }), // QK 10.55
+            Phase::compute(OpTemplate { chains: 1, depth: 162, cyc_per_op: 1, op_latency: 1 }),  // SOFTMAX 1.62
+            Phase::memory(655),  // VLOAD   6.55 ms
+            Phase::compute(OpTemplate { chains: 1, depth: 724, cyc_per_op: 1, op_latency: 1 }),  // PV 7.24
+            Phase::compute(OpTemplate { chains: 1, depth: 4, cyc_per_op: 1, op_latency: 1 }),    // SETUP 0.04
+        ]
+    }
+
+    #[test]
+    fn serial_reproduces_the_measured_whole_op() {
+        let phases = fattn_phases();
+        let comp = OpComposition { phases: &phases };
+        // Measured FATTN_DECODE whole-op wall: 33.68 ms = 3368 centi-ms. The phase
+        // laps sum to 3358; within the one-thread-sample tolerance (< 0.5%).
+        assert_eq!(comp.serial_cycles(), 3358);
+        assert!((comp.serial_cycles() as i32 - 3368).abs() <= 20);
+    }
+
+    #[test]
+    fn overlap_projects_the_double_buffer_floor() {
+        let phases = fattn_phases();
+        let comp = OpComposition { phases: &phases };
+        // memory lane = 758 + 655 = 1413; compute lane = 1055 + 162 + 724 + 4 = 1945.
+        assert_eq!(comp.lane_cycles(Lane::Memory), 1413);
+        assert_eq!(comp.lane_cycles(Lane::Compute), 1945);
+        // A perfect double-buffer hides the 14.1 ms of load under the 19.45 ms of
+        // compute: op -> 19.45 ms (from 33.58), the ~30% decode prize.
+        assert_eq!(comp.overlapped_cycles(), 1945);
+    }
+
+    // The discriminator the single-chain model lacked: the smem double-buffer
+    // spends no registers (creditable -> the overlap floor); the register-prefetch
+    // spends registers, fails the compute leg's hide gate (not creditable -> the
+    // serial sum), which is exactly what regressed three times on the rig.
+    #[test]
+    fn register_gate_separates_double_buffer_from_prefetch() {
+        let phases = fattn_phases();
+        let comp = OpComposition { phases: &phases };
+        // FATTN QK compute leg: 7 chains hide the 14-cyc HMMA at 2 cyc/op (the
+        // worked case of register_spend_reexposes_latency). Budget 128 over a
+        // 100-reg base just fits 7 chains.
+        let qk = OpTemplate { chains: 7, depth: 64, cyc_per_op: 2, op_latency: 14 };
+        let (budget, base, per) = (128u32, 100u32, 4u32);
+        // smem double-buffer: spends no registers -> 7 chains sustained -> creditable.
+        let db_creditable = qk.overlap_keeps_hidden(budget, base, per, 0);
+        assert!(db_creditable);
+        assert_eq!(comp.overlapped_if(db_creditable), 1945); // the win
+
+        // register-prefetch: spends 12 registers -> only 4 chains sustained -> the
+        // recurrence re-exposes -> NOT creditable -> the composition falls back to
+        // the serial sum, matching the three rig regressions.
+        let pf_creditable = qk.overlap_keeps_hidden(budget, base, per, 12);
+        assert!(!pf_creditable);
+        assert_eq!(comp.overlapped_if(pf_creditable), 3358); // no credit -> serial
+    }
 }
