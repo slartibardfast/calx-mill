@@ -15,7 +15,9 @@ use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
 use calx_mill::{achievable_chains, Bottleneck, Lane, OpComposition, OpTemplate, Phase};
 use calx_mill::validity::{authority, verdict, Anchor, DomainFit, Verdict};
-use calx_mill::telemetry::{overlap_fraction, parse_tele, TeleRecord};
+use calx_mill::telemetry::{
+    measured_bottleneck, op_pipe_rate, overlap_fraction, parse_tele, TeleRecord,
+};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -552,16 +554,32 @@ fn run() -> Result<i32, String> {
             // Heavy hitters by measured wall.
             let mut idx: Vec<usize> = (0..recs.len()).collect();
             idx.sort_by(|&a, &b| recs[b].cycles.cmp(&recs[a].cycles));
-            println!("  top ops by measured wall (op_index kind lane cycles gt-ns):");
+            println!(
+                "  top ops by measured wall (op_index kind lane cycles wall-ns bind):"
+            );
             for &i in idx.iter().take(8) {
                 let r: &TeleRecord = &recs[i];
+                // per-op pipe-rate wiring: the op kind selects the pipe rate that populates
+                // the measured Pipe column, so the binding column classifies (mem/pipe/lat).
+                let rate = op_pipe_rate(&r.kind);
+                let bind = if r.bytes == 0 && (r.ops == 0 || rate == 0.0) {
+                    "-".to_string() // no bytes/ops columns yet -> unclassified
+                } else {
+                    match measured_bottleneck(r, rate, 0.0) {
+                        Bottleneck::Memory => "mem".to_string(),
+                        Bottleneck::Pipe(_) => "pipe".to_string(),
+                        Bottleneck::Latency => "lat".to_string(),
+                        Bottleneck::IssueCap => "issue".to_string(),
+                    }
+                };
                 println!(
-                    "    {:>5} {:<16} {:<7} {:>10} {:>10}",
+                    "    {:>5} {:<16} {:<7} {:>10} {:>10} {:>5}",
                     r.op_index,
                     r.kind,
                     if r.lane == Lane::Memory { "mem" } else { "compute" },
                     r.cycles,
-                    r.span_ns()
+                    r.wall_ns(),
+                    bind,
                 );
             }
             // Realized overlap of adjacent lane-crossing pairs (the T6 input): how much

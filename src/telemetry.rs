@@ -21,9 +21,25 @@ use crate::{select_bound, Bottleneck, Lane, ResourceKind, SteadyState};
 /// `MemoryBw` cycle demand and bounds T1.
 pub const PEAK_DRAM_BYTES_PER_CYCLE: f64 = 609.0e9 / 1.455e9; // ~418.6
 
+/// GPU-global peak HMMA (tensor-pipe) rate in ops/cycle: `0.5 HMMA/SM/clk` (PAPER.md
+/// tab:tensor, m16n8k8 f32-acc) × 72 SMs (`nvidia::ptxas::TU102_SMS`). The Pipe-column
+/// denominator for a tensor op's SCHEDULE-KNOWN whole-op HMMA count, matching the
+/// GPU-global convention `PEAK_DRAM_BYTES_PER_CYCLE` uses for the MemoryBw column.
+pub const TU102_HMMA_PER_CYCLE: f64 = 0.5 * 72.0; // = 36.0
+/// GPU-global peak fma-pipe rate in ops/cycle: `2.0 op/SM/clk` (PAPER.md tab:alu — FFMA
+/// and the fma-pipe-bound `IDP.4A`/dp4a both saturate at 2/SM/clk) × 72 SMs. The
+/// Pipe-column denominator for the CUDA-core GEMV/dp4a ops.
+pub const TU102_FMA_PER_CYCLE: f64 = 2.0 * 72.0; // = 144.0
+
 /// One per-op telemetry record — the frozen kernel↔calx-mill seam (spec §seam). `bytes`
 /// or `ops` == 0 means "column absent" (attached in a later pass; the ingest then emits
 /// no `MemoryBw`/`Pipe` demand, matching `mix_demands`' zero convention).
+///
+/// `op_wall_ns` is a HOST-ATTACHED aggregate (like `bytes`/`ops`, NOT a new device-emitted
+/// field — the four-value device ring is unchanged): the op's TRUE whole-op wall (the max
+/// block span) for a block-uneven op, where block-0's own `%globaltimer` span under-counts
+/// it. `0` means absent → the roofline falls back to block-0's `span_ns`, the prior
+/// behaviour. See [`TeleRecord::wall_ns`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeleRecord {
     pub op_index: u32,
@@ -34,6 +50,7 @@ pub struct TeleRecord {
     pub cycles: u64,
     pub bytes: u64,
     pub ops: u64,
+    pub op_wall_ns: u64,
 }
 
 impl TeleRecord {
@@ -41,10 +58,26 @@ impl TeleRecord {
     pub fn span_ns(&self) -> u64 {
         self.gt_end_ns.saturating_sub(self.gt_start_ns)
     }
-    /// Achieved DRAM GB/s = bytes / span-ns (1 byte/ns == 1 GB/s). Zero when the span or
-    /// bytes are absent.
+    /// The op's TRUE whole-op wall in ns: the host-attached `op_wall_ns` (max block span)
+    /// when present, else block-0's `%globaltimer` `span_ns`. For a BLOCK-UNEVEN op — a
+    /// GEMV whose blocks own unequal row counts — block-0 finishes early, so `span_ns`
+    /// under-counts the op wall and `bytes / span_ns` OVER-counts the achieved rate, a
+    /// false T1 roofline reject (`whole-op-bytes` are GPU-global, but the span is one
+    /// block's). Using the true wall makes the numerator and denominator commensurate.
+    /// `max` keeps the accessor monotone (`>= span_ns`) even against a mis-attached value,
+    /// so the correction can only LOWER the achieved rate — it removes false rejects, it
+    /// can never manufacture a false accept.
+    pub fn wall_ns(&self) -> u64 {
+        if self.op_wall_ns > 0 {
+            self.op_wall_ns.max(self.span_ns())
+        } else {
+            self.span_ns()
+        }
+    }
+    /// Achieved DRAM GB/s = bytes / wall-ns (1 byte/ns == 1 GB/s), over the TRUE op wall
+    /// ([`Self::wall_ns`]), not block-0's span. Zero when the wall or bytes are absent.
     pub fn achieved_gbps(&self) -> f64 {
-        let ns = self.span_ns();
+        let ns = self.wall_ns();
         if ns == 0 || self.bytes == 0 {
             return 0.0;
         }
@@ -99,6 +132,24 @@ pub fn measured_bottleneck(r: &TeleRecord, peak_pipe_rate: f64, tol: f64) -> Bot
         Bottleneck::Memory
     } else {
         Bottleneck::Pipe(0)
+    }
+}
+
+/// The GPU-global peak pipe rate (ops/cycle) for an op KIND — the per-op pipe-rate wiring
+/// that lets the measured `Pipe` column populate from the schedule's ops (spec
+/// §reconstruction: `Pipe(i) = ops / peak_rate[i]`). The schedule knows which pipe an op
+/// dispatches to; calx-mill supplies the substrate rate. Tensor ops (FATTN / HMMA GEMM)
+/// bind the HMMA pipe; the CUDA-core weight-stream GEMVs (MMVQ / dp4a) bind the fma pipe.
+/// An unrecognized kind (or one with no `ops` numerator) returns `0.0` → no `Pipe` column,
+/// matching the zero convention (`mix_demands` / [`measured_steady_state`]).
+pub fn op_pipe_rate(kind: &str) -> f64 {
+    let k = kind.to_ascii_uppercase();
+    if k.contains("FATTN") || k.contains("HMMA") || k.contains("GEMM") || k.contains("ATTN") {
+        TU102_HMMA_PER_CYCLE
+    } else if k.contains("MMVQ") || k.contains("GEMV") || k.contains("DP4A") || k.contains("IDP") {
+        TU102_FMA_PER_CYCLE
+    } else {
+        0.0
     }
 }
 
@@ -159,7 +210,9 @@ pub fn parse_tele(text: &str) -> Vec<TeleRecord> {
         if line.is_empty() || line.starts_with("op_index") || line.starts_with('#') {
             continue;
         }
-        // schema: op_index op_kind lane gt_start_ns gt_end_ns cycles bytes ops
+        // schema: op_index op_kind lane gt_start_ns gt_end_ns cycles bytes ops [op_wall_ns]
+        // op_wall_ns is an OPTIONAL trailing column (host-attached true-op-wall); older
+        // 8-column files parse unchanged with op_wall_ns == 0.
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 8 {
             continue;
@@ -183,6 +236,7 @@ pub fn parse_tele(text: &str) -> Vec<TeleRecord> {
             cycles: cyc,
             bytes,
             ops,
+            op_wall_ns: f.get(8).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
         });
     }
     out
@@ -202,6 +256,7 @@ mod tests {
             cycles: cyc,
             bytes,
             ops,
+            op_wall_ns: 0,
         }
     }
 
@@ -281,6 +336,79 @@ mod tests {
         assert_eq!(v[0].op_index, 6);
         assert_eq!(v[0].cycles, 75282);
         assert_eq!(v[0].lane, Lane::Memory);
+        assert_eq!(v[0].op_wall_ns, 0); // 8-column file -> absent -> block-0 span
+    }
+
+    // (b) true-op-wall: a block-uneven GEMV whose WHOLE-op bytes divided by BLOCK-0's short
+    // span implies a super-peak rate — a false T1 reject. The host-attached true op wall
+    // (max block span) makes numerator and denominator commensurate and clears the reject.
+    #[test]
+    fn true_op_wall_clears_block_uneven_false_reject() {
+        // 100 kB whole-op over block-0's 100 ns span => 1000 GB/s > 609 => FALSE reject.
+        let block0 = rec(0, 100, 0, 100_000, 0);
+        assert!(!block0.roofline_ok());
+        assert_eq!(block0.wall_ns(), 100);
+        // The op's true wall (slowest block) is 200 ns => 500 GB/s <= 609 => accepted.
+        let mut whole = block0.clone();
+        whole.op_wall_ns = 200;
+        assert_eq!(whole.wall_ns(), 200);
+        assert!(whole.roofline_ok());
+        // Monotone/robust: a mis-attached wall SHORTER than block-0's span never raises the
+        // rate (max keeps wall_ns >= span_ns), so it cannot manufacture a false accept.
+        let mut bad = block0.clone();
+        bad.op_wall_ns = 50; // < span 100
+        assert_eq!(bad.wall_ns(), 100); // clamped up to the span
+        assert!(!bad.roofline_ok());
+    }
+
+    #[test]
+    fn parse_reads_optional_op_wall_column() {
+        // 9-column row: the trailing op_wall_ns is picked up.
+        let t = "op_index\top_kind\tlane\tgt_start_ns\tgt_end_ns\tcycles\tbytes\tops\top_wall_ns\n\
+                 6\tMMVQ_Q4_0\tmem\t100\t200\t75282\t100000\t0\t340\n";
+        let v = parse_tele(t);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].op_wall_ns, 340);
+        assert_eq!(v[0].wall_ns(), 340); // 340 > span 100
+    }
+
+    // (a) per-op pipe-rate wiring: the schedule's op kind selects the pipe rate that
+    // populates the measured Pipe column, so the bottleneck classifies correctly.
+    #[test]
+    fn op_pipe_rate_routes_by_kind() {
+        assert_eq!(op_pipe_rate("FATTN_DECODE"), TU102_HMMA_PER_CYCLE);
+        assert_eq!(op_pipe_rate("HMMA_QK"), TU102_HMMA_PER_CYCLE);
+        assert_eq!(op_pipe_rate("MMVQ_Q4_0"), TU102_FMA_PER_CYCLE);
+        assert_eq!(op_pipe_rate("GEMV_F16"), TU102_FMA_PER_CYCLE);
+        assert_eq!(op_pipe_rate("RMSNORM"), 0.0); // unrecognized -> no Pipe column
+    }
+
+    #[test]
+    fn pipe_column_populates_and_classifies() {
+        // A compute-bound FATTN-like op: big HMMA count, small bytes, wall == the pipe demand.
+        // ops 3600 / 36 HMMA-per-cyc = 100 cyc pipe demand; wall 100 => Pipe-bound.
+        let r = TeleRecord {
+            op_index: 0,
+            kind: "FATTN_DECODE".into(),
+            lane: Lane::Compute,
+            gt_start_ns: 0,
+            gt_end_ns: 0,
+            cycles: 100,
+            bytes: 418, // ~1 cyc of DRAM — negligible
+            ops: 3600,
+            op_wall_ns: 0,
+        };
+        let rate = op_pipe_rate(&r.kind);
+        let ss = measured_steady_state(&r, rate);
+        // the Pipe column is present (populated from ops / rate) and equals 3600/36 = 100.
+        let pipe = ss
+            .per_resource
+            .iter()
+            .find(|(k, _)| *k == ResourceKind::Pipe(0))
+            .unwrap()
+            .1;
+        assert_eq!(pipe, 100.0);
+        assert_eq!(measured_bottleneck(&r, rate, 5.0), Bottleneck::Pipe(0));
     }
 }
 
@@ -298,6 +426,7 @@ mod proofs {
             cycles: kani::any(),
             bytes: 0,
             ops: 0,
+            op_wall_ns: kani::any(),
         }
     }
 
@@ -315,5 +444,23 @@ mod proofs {
         // span is never "negative": saturating.
         let _ = a.span_ns();
         assert!(a.span_ns() == a.gt_end_ns.saturating_sub(a.gt_start_ns));
+    }
+
+    // (b) true-op-wall never falls below block-0's span, for ANY host-attached op_wall_ns
+    // (incl. a mis-attached one shorter than the span). This is the anti-optimism guarantee
+    // of the roofline correction: wall_ns >= span_ns, so bytes/wall <= bytes/span, so the
+    // true-wall achieved rate is never ABOVE the block-0-span rate — the correction can
+    // only remove a false T1 reject, never manufacture a false accept. Integer/structural
+    // (no FP division; the rate-monotonicity is the accompanying unit test, matching the
+    // codebase convention of keeping FP-division facts in tests).
+    #[kani::proof]
+    fn true_wall_never_below_block0_span() {
+        let mut r = any_rec();
+        kani::assume(r.gt_start_ns <= (1 << 20) && r.gt_end_ns <= (1 << 20));
+        kani::assume(r.op_wall_ns <= (1 << 20));
+        assert!(r.wall_ns() >= r.span_ns());
+        // absence (op_wall_ns == 0) reduces to the prior block-0-span behaviour.
+        r.op_wall_ns = 0;
+        assert!(r.wall_ns() == r.span_ns());
     }
 }
