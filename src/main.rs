@@ -14,6 +14,7 @@ use calx_mill::nvidia::table::Rates;
 use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
 use calx_mill::{achievable_chains, Bottleneck, Lane, OpComposition, OpTemplate, Phase};
+use calx_mill::validity::{authority, verdict, Anchor, DomainFit, Verdict};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -64,6 +65,14 @@ commands:
       the --spend registers: a smem double-buffer (spend 0) earns the floor, a
       register-prefetch (spend > headroom) falls back to serial. e.g. FATTN deep:
       --mem-cycles 1413 --compute-cycles 1945 -> serial 3358, overlapped 1945.
+
+  gate --value V --anchor M --tol T [--at-anchor A] --fit at-anchor|in-domain|out-of-domain
+      projection-validity ARBITER (plan/0144/spec/projection-validity.md): judge a claim
+      against its measured anchor + domain and emit CERTIFIED (Gate) | PROVISIONAL
+      (CrossChecked -- build, bench confirms) | REFUSED (Advisory -- exit 2, the bench gates).
+      `anchored` = the model's value AT the anchor (--at-anchor, default V) reproduces M±T.
+      Makes an unvalidated projection un-launderable into a pass. e.g. a KL claim of 1.8e-7
+      against anchor 0.02 --fit out-of-domain -> REFUSED.
 
 kernel PAT is the subset the tools use: literals, '.', '\\d', with '*'/'+'.
 Binaries are disassembled via cuobjdump (override with CUOBJDUMP); .sass
@@ -468,6 +477,49 @@ fn run() -> Result<i32, String> {
                 );
             }
             Ok(0)
+        }
+        "gate" => {
+            // projection-validity ARBITER (plan/0144/spec/projection-validity.md): judge one
+            // claim against its anchor + domain and emit CERTIFIED | PROVISIONAL | REFUSED.
+            // The tool adjudicates; the agent attaches the verdict, never overrides it.
+            let args = Args::parse(
+                rest,
+                &["value", "anchor", "tol", "at-anchor", "fit"],
+            )?;
+            let value = args.number::<f64>("value", 0.0)?;
+            let measured = args.number::<f64>("anchor", 0.0)?;
+            let tol = args.number::<f64>("tol", 0.0)?;
+            let at_anchor = args.number::<f64>("at-anchor", value)?; // model's value AT the anchor
+            let fit = match args.value("fit").unwrap_or("in-domain") {
+                "at-anchor" => DomainFit::AtAnchor,
+                "in-domain" => DomainFit::InDomain,
+                "out-of-domain" | "out" => DomainFit::OutOfDomain,
+                other => return Err(format!("--fit must be at-anchor|in-domain|out-of-domain, got {:?}", other)),
+            };
+            let anchor = Anchor { measured, tol };
+            let anchored = anchor.reproduces(at_anchor);
+            let a = authority(anchored, fit);
+            match verdict(a) {
+                Verdict::Certified => {
+                    println!("CERTIFIED value={} (Gate: reproduces anchor {}±{} at this query)",
+                             value, measured, tol);
+                    Ok(0)
+                }
+                Verdict::Provisional => {
+                    println!("PROVISIONAL value={} (CrossChecked: anchored model, extrapolated \
+                              -- decide/build on it, the bench confirms; NOT a terminal gate)", value);
+                    Ok(0)
+                }
+                Verdict::Refused => {
+                    let why = if !anchored {
+                        format!("does not reproduce anchor {}±{} (got {})", measured, tol, at_anchor)
+                    } else {
+                        "out of the anchored domain".to_string()
+                    };
+                    println!("REFUSED: {} -> the bench/oracle gates, not the model.", why);
+                    Ok(2)   // non-zero: an unvalidated projection cannot be laundered into a pass
+                }
+            }
         }
         "--help" | "-h" | "help" => {
             println!("{}", USAGE);
