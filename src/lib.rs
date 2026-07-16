@@ -1459,4 +1459,42 @@ mod op_composition_tests {
         assert!(!pf_creditable);
         assert_eq!(comp.overlapped_if(pf_creditable), 3358); // no credit -> serial
     }
+
+    // BREADTH GATE (the overfit falsifier, cf. op-templates): FATTN's lanes are
+    // BALANCED (14.1 mem vs 19.4 compute), so overlap is a big win (33.6 -> 19.4,
+    // -42%). A composition that "learned FATTN" would promise a big win on any op.
+    // These two LOPSIDED ops prove it does not: the win tracks lane balance, and a
+    // one-lane op is bound by that lane regardless of the overlap. If either
+    // regressed to "big win", the model overfit the balanced case.
+
+    // (1) Compute-dominated op (heavy math, tiny activation load): overlap hides
+    // only the small memory lane, so it barely helps -- the model must NOT promise
+    // a FATTN-sized win.
+    #[test]
+    fn compute_dominated_overlap_barely_helps() {
+        let phases = [Phase::memory(200), Phase::compute(
+            OpTemplate { chains: 1, depth: 1800, cyc_per_op: 1, op_latency: 1 })];
+        let comp = OpComposition { phases: &phases };
+        assert_eq!(comp.serial_cycles(), 2000);
+        assert_eq!(comp.overlapped_cycles(), 1800); // == compute lane; only 200 hidden
+        // savings 10% (vs FATTN's 42%): overlap is not worth much here.
+        assert!(comp.serial_cycles() - comp.overlapped_cycles() <= comp.serial_cycles() / 5);
+    }
+
+    // (2) Memory-dominated op (weight-stream GEMV, tiny dp4a): the floor is the
+    // memory lane, and the compute-lane register gate cannot lower it -- overlap
+    // is memory-bound, not compute-hideable.
+    #[test]
+    fn memory_dominated_is_bounded_by_the_memory_lane() {
+        let phases = [Phase::memory(1800), Phase::compute(
+            OpTemplate { chains: 1, depth: 200, cyc_per_op: 1, op_latency: 1 })];
+        let comp = OpComposition { phases: &phases };
+        assert_eq!(comp.lane_cycles(Lane::Memory), 1800);
+        assert_eq!(comp.overlapped_cycles(), 1800); // == memory lane
+        // Even a fully-creditable overlap (compute ILP intact) stays at the memory
+        // lane: the register gate is irrelevant when memory dominates.
+        let t = OpTemplate { chains: 8, depth: 4, cyc_per_op: 2, op_latency: 14 };
+        assert!(t.overlap_keeps_hidden(256, 100, 4, 0));
+        assert_eq!(comp.overlapped_if(true), comp.lane_cycles(Lane::Memory));
+    }
 }
