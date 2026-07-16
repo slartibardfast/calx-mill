@@ -668,6 +668,61 @@ impl<'a> OpComposition<'a> {
     }
 }
 
+/// Merge two overlapped lanes' per-resource cycle demands: overlapping the lanes
+/// means their demands ADD on every resource they share. Entries with the same
+/// [`ResourceKind`] sum; disjoint resources stay separate.
+///
+/// # Arguments
+/// * `a`, `b` — each lane's `(resource, cycle-demand)` vector (as `mix_demands`
+///   builds, or hand-derived from a profile: DRAM bytes/bandwidth, smem-bandwidth
+///   cycles, tensor-pipe cycles).
+///
+/// # Returns
+/// The merged demand vector, ready for [`select_bound`].
+pub fn merge_demands(
+    a: &[(ResourceKind, f64)],
+    b: &[(ResourceKind, f64)],
+) -> Vec<(ResourceKind, f64)> {
+    let mut out: Vec<(ResourceKind, f64)> = a.to_vec();
+    for &(kind, c) in b {
+        if let Some(e) = out.iter_mut().find(|(k, _)| *k == kind) {
+            e.1 += c;
+        } else {
+            out.push((kind, c));
+        }
+    }
+    out
+}
+
+/// Contention-aware overlapped time: the roofline (`select_bound` PPM) of the two
+/// lanes' MERGED per-resource demands. **This function is the realization of the
+/// specification `plan/0143/spec/overlap-contention.md`** (authored first; the laws
+/// L1–L8 there are discharged by the `overlap_*` / `contention_*` Kani proofs).
+/// This is the fix for [`OpComposition`]'s
+/// opaque `overlapped_cycles = max(lane_sums)`, which assumed the compute lane is
+/// invariant under overlap. It is not: a resource both lanes touch (DRAM, smem
+/// bandwidth) sums and can re-bind ABOVE `max(mem, compute)` — the load hides only
+/// on resources the compute lane does not already saturate (call/0033, refuted on
+/// the FATTN double-buffer: hiding the K/V load exposed QK's global `q` reads and
+/// PV's smem `V` reads to contention with the movers' traffic).
+///
+/// # Arguments
+/// * `mem_lane`, `compute_lane` — the overlapped lanes' `(resource, cycles)` demands.
+///
+/// # Returns
+/// The overlapped cycle count that respects contention.
+///
+/// # Guarantees
+/// `max(ppm(mem), ppm(compute)) <= overlapped_contended <= ppm(mem) + ppm(compute)
+/// summed as serial` — contention never helps (>= each lane's own bound) and never
+/// exceeds running the lanes fully in series (proof `contention_brackets_overlap`).
+pub fn overlapped_contended(
+    mem_lane: &[(ResourceKind, f64)],
+    compute_lane: &[(ResourceKind, f64)],
+) -> f64 {
+    select_bound(&merge_demands(mem_lane, compute_lane)).ppm_cycles
+}
+
 pub mod nvidia;
 
 #[cfg(kani)]
@@ -1177,6 +1232,63 @@ mod proofs {
             "gating off never yields a smaller (optimistic) projection",
         );
     }
+
+    // L3 No free lunch: the overlap never beats either lane's own roofline -- the
+    // anti-optimism guarantee (a merged resource sums, so it can only re-bind higher).
+    // The `<=` serial ceiling (L4) is a test, not Kani: comparing overlapped_contended
+    // (an FP sum) against ppm_a+ppm_b (another FP sum) bit-blasts past CBMC's deadline;
+    // a single `>=` like this one, and like monotone/disjoint, stays tractable.
+    #[kani::proof]
+    fn contention_no_free_lunch() {
+        let a0 = any_demand_value(); let a1 = any_demand_value();
+        let b0 = any_demand_value(); let b1 = any_demand_value();
+        kani::assume(a0 >= 0.0 && a1 >= 0.0 && b0 >= 0.0 && b1 >= 0.0);
+        let a = [(ResourceKind::Pipe(0), a0), (ResourceKind::MemoryBw, a1)];
+        let b = [(ResourceKind::Pipe(0), b0), (ResourceKind::MemoryBw, b1)];
+        let ov = overlapped_contended(&a, &b);
+        let ppm_a = if a0 >= a1 { a0 } else { a1 };
+        let ppm_b = if b0 >= b1 { b0 } else { b1 };
+        let lo = if ppm_a >= ppm_b { ppm_a } else { ppm_b };
+        kani::assert(ov >= lo, "contention never beats either lane's own bound"); // L3
+    }
+
+    // L2 Disjoint => ideal: lanes on disjoint resources overlap to the max (full hide).
+    #[kani::proof]
+    fn disjoint_overlap_is_max() {
+        let a0 = any_demand_value(); let b0 = any_demand_value();
+        kani::assume(a0 >= 0.0 && b0 >= 0.0);
+        let a = [(ResourceKind::Pipe(0), a0)];       // pure compute pipe
+        let b = [(ResourceKind::MemoryBw, b0)];      // pure DRAM -- disjoint from a
+        let ov = overlapped_contended(&a, &b);
+        let m = if a0 >= b0 { a0 } else { b0 };
+        kani::assert(ov == m, "disjoint lanes overlap to max(ppm) -- the ideal");
+    }
+
+    // L5 Monotone: raising any demand never lowers the overlap.
+    #[kani::proof]
+    fn overlap_monotone_in_demand() {
+        let a0 = any_demand_value(); let a1 = any_demand_value();
+        let b0 = any_demand_value(); let b1 = any_demand_value();
+        let d = any_demand_value();
+        kani::assume(a0 >= 0.0 && a1 >= 0.0 && b0 >= 0.0 && b1 >= 0.0 && d >= 0.0);
+        let a  = [(ResourceKind::Pipe(0), a0), (ResourceKind::MemoryBw, a1)];
+        let ap = [(ResourceKind::Pipe(0), a0 + d), (ResourceKind::MemoryBw, a1)];
+        let b  = [(ResourceKind::Pipe(0), b0), (ResourceKind::MemoryBw, b1)];
+        kani::assert(overlapped_contended(&ap, &b) >= overlapped_contended(&a, &b),
+                     "raising a demand never lowers the overlap");
+    }
+
+    // L6 Commutative (bit-exact: IEEE-754 + commutes, ppm is a max).
+    #[kani::proof]
+    fn overlap_commutes() {
+        let a0 = any_demand_value(); let a1 = any_demand_value();
+        let b0 = any_demand_value(); let b1 = any_demand_value();
+        kani::assume(a0 >= 0.0 && a1 >= 0.0 && b0 >= 0.0 && b1 >= 0.0);
+        let a = [(ResourceKind::Pipe(0), a0), (ResourceKind::MemoryBw, a1)];
+        let b = [(ResourceKind::Pipe(0), b0), (ResourceKind::MemoryBw, b1)];
+        kani::assert(overlapped_contended(&a, &b) == overlapped_contended(&b, &a),
+                     "overlap(a,b) == overlap(b,a)");
+    }
 }
 
 #[cfg(test)]
@@ -1496,5 +1608,107 @@ mod op_composition_tests {
         let t = OpTemplate { chains: 8, depth: 4, cyc_per_op: 2, op_latency: 14 };
         assert!(t.overlap_keeps_hidden(256, 100, 4, 0));
         assert_eq!(comp.overlapped_if(true), comp.lane_cycles(Lane::Memory));
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+
+    // Demands in tenths-of-a-millisecond (unit-agnostic), from the measured FATTN
+    // double-buffer profile (plan/0143/capture/fattn-dbuf-analysis.md). The model
+    // must reproduce every measured verdict: overlap helps only when the lanes'
+    // binding resources are DISJOINT.
+
+    // L1 Identity (structural, test-covered not Kani -- CBMC chokes on the empty-slice
+    // path through merge_demands's Vec; the fact is definitional: empty adds no demand).
+    #[test]
+    fn overlap_with_empty_is_the_lane() {
+        let a = [(ResourceKind::Pipe(0), 103.0), (ResourceKind::MemoryBw, 65.0)];
+        let empty: [(ResourceKind, f64); 0] = [];
+        assert_eq!(overlapped_contended(&a, &empty), select_bound(&a).ppm_cycles);
+        assert_eq!(overlapped_contended(&empty, &a), select_bound(&a).ppm_cycles);
+    }
+
+    // L4 Serial ceiling (test; the FP-sum comparison bit-blasts CBMC -- see the
+    // contention_no_free_lunch note): overlap never exceeds the two lanes in series.
+    #[test]
+    fn overlap_never_exceeds_serial() {
+        let a = [(ResourceKind::Pipe(0), 103.0), (ResourceKind::MemoryBw, 65.0)];
+        let b = [(ResourceKind::Pipe(0), 80.0), (ResourceKind::MemoryBw, 76.0)];
+        let ov = overlapped_contended(&a, &b);
+        let ppm_a = select_bound(&a).ppm_cycles;
+        let ppm_b = select_bound(&b).ppm_cycles;
+        assert!(ov <= ppm_a + ppm_b);           // <= serial (L4)
+        assert!(ov >= ppm_a.max(ppm_b));         // >= each lane (L3, cross-check)
+    }
+
+    // (A) Disjoint: V-load is pure DRAM, QK (q in smem) is pure tensor -> the load
+    // hides fully, overlapped == the compute lane. This is when overlap WINS.
+    #[test]
+    fn disjoint_lanes_overlap_fully() {
+        let vload = [(ResourceKind::MemoryBw, 65.0)];       // 6.5 ms DRAM
+        let qk = [(ResourceKind::Pipe(0), 103.0)];          // 10.3 ms tensor
+        let ov = overlapped_contended(&vload, &qk);
+        assert_eq!(ov, 103.0);                              // == compute; load hidden
+        assert!(ov < 65.0 + 103.0);                        // beats serial 16.8 ms
+    }
+
+    // (B) Shared DRAM: QK re-reads q from GLOBAL, so its MemoryBw demand sums with
+    // the V-load's -> DRAM re-binds ABOVE the compute lane. Reproduces the measured
+    // QK balloon (10.3 -> 22.9 ms) the naive max(lanes) could not predict.
+    #[test]
+    fn shared_dram_contends_the_qk_balloon() {
+        let vload = [(ResourceKind::MemoryBw, 65.0)];
+        let qk_global_q = [(ResourceKind::Pipe(0), 103.0), (ResourceKind::MemoryBw, 80.0)];
+        let ov = overlapped_contended(&vload, &qk_global_q);
+        // DRAM demand 65 + 80 = 145 > the tensor 103 -> DRAM-bound, overlap HURTS.
+        assert_eq!(ov, 145.0);
+        let naive = 103.0f64.max(65.0); // max(compute_ppm, mem_ppm) -- the wrong answer
+        assert!(ov > naive, "contention exceeds the naive max(lanes) -- the refutation");
+    }
+
+    // (C) The q-staging fix: q moves to smem, so QK's off-tensor demand is
+    // LocalStoreBw, NOT MemoryBw -> DRAM no longer contends, tensor binds again.
+    #[test]
+    fn smem_q_restores_the_overlap() {
+        let vload = [(ResourceKind::MemoryBw, 65.0)];
+        let qk_smem_q = [(ResourceKind::Pipe(0), 103.0), (ResourceKind::LocalStoreBw, 30.0)];
+        let ov = overlapped_contended(&vload, &qk_smem_q);
+        assert_eq!(ov, 103.0); // tensor binds; load + smem-q both fit under it
+    }
+
+    // (D) PV smem contention: PV reads tileV from smem while the movers WRITE tileK
+    // to smem -> LocalStoreBw sums and binds. Reproduces PV 7.2 -> 15.0 ms, the cap
+    // the q-staging could not remove.
+    #[test]
+    fn pv_smem_write_contends() {
+        let kload = [(ResourceKind::MemoryBw, 76.0), (ResourceKind::LocalStoreBw, 50.0)];
+        let pv = [(ResourceKind::Pipe(0), 72.0), (ResourceKind::LocalStoreBw, 50.0)];
+        let ov = overlapped_contended(&kload, &pv);
+        // smem 50 + 50 = 100 > DRAM 76 > tensor 72 -> smem-bound, PV inflates.
+        assert_eq!(ov, 100.0);
+        assert!(ov > 76.0f64.max(72.0), "smem contention exceeds max(lanes)");
+    }
+
+    // The payoff: PRE-EVALUATE the V-only-overlap lever WITHOUT building it. Overlap
+    // only the V-load under QK (phase A); keep the K-load SERIAL so PV runs with no
+    // concurrent smem writer (phase B, no contention). The model composes the phases:
+    #[test]
+    fn v_only_overlap_is_predicted_a_win() {
+        // phase A: V-load hidden under QK (disjoint, from test C) -> 103
+        let phase_a = overlapped_contended(
+            &[(ResourceKind::MemoryBw, 65.0)],
+            &[(ResourceKind::Pipe(0), 103.0), (ResourceKind::LocalStoreBw, 30.0)],
+        );
+        // phase B: PV alone, no mover -> no smem-write contention -> tensor 72
+        let phase_b = select_bound(&[(ResourceKind::Pipe(0), 72.0),
+                                     (ResourceKind::LocalStoreBw, 50.0)]).ppm_cycles;
+        let k_serial = 76.0;   // K-load, its own step (full-bandwidth, all threads)
+        let softmax = 16.0;
+        let est = phase_a + phase_b + k_serial + softmax;   // 103+72+76+16 = 267 (26.7 ms)
+        let baseline = 337.0;  // both-split FATTN 33.7 ms
+        assert!(est < baseline, "V-only overlap is projected to beat the both-split");
+        assert!((est - 267.0).abs() < 1.0);   // ~26.7 ms, a ~20% win -- worth a build
     }
 }
