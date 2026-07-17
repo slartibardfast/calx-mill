@@ -247,10 +247,19 @@ pub fn gate_op(
 }
 
 /// Parse a `.tele` TSV (the header line names the columns; see the spec seam). Unknown
-/// lanes default to `Compute`. Malformed rows are skipped. Returns the records in file
-/// order.
+/// lanes default to `Compute`. Malformed rows are skipped — see
+/// [`parse_tele_counted`] for the loss surfaced. Returns the records in file order.
 pub fn parse_tele(text: &str) -> Vec<TeleRecord> {
+    parse_tele_counted(text).0
+}
+
+/// [`parse_tele`] with the loss surfaced: `(records, skipped)`, where `skipped`
+/// counts data-shaped rows dropped as malformed (short or unparseable). Header,
+/// comment, and blank lines are not losses. An instrument that drops records must
+/// say so: a truncated or corrupted `.tele` no longer passes silently.
+pub fn parse_tele_counted(text: &str) -> (Vec<TeleRecord>, usize) {
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with("op_index") || line.starts_with('#') {
@@ -261,6 +270,7 @@ pub fn parse_tele(text: &str) -> Vec<TeleRecord> {
         // 8-column files parse unchanged with op_wall_ns == 0.
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 8 {
+            skipped += 1;
             continue;
         }
         let (Some(op_index), Some(gs), Some(ge), Some(cyc), Some(bytes), Some(ops)) = (
@@ -271,6 +281,7 @@ pub fn parse_tele(text: &str) -> Vec<TeleRecord> {
             f[6].parse::<u64>().ok(),
             f[7].parse::<u64>().ok(),
         ) else {
+            skipped += 1;
             continue;
         };
         out.push(TeleRecord {
@@ -285,7 +296,7 @@ pub fn parse_tele(text: &str) -> Vec<TeleRecord> {
             op_wall_ns: f.get(8).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
         });
     }
-    out
+    (out, skipped)
 }
 
 #[cfg(test)]
@@ -371,6 +382,23 @@ mod tests {
         // small bytes/ops (tiny throughput demand) but a big wall -> recurrence exposed.
         let r = rec(0, 10, 1000, 418, 0); // mem demand ~1 cyc, wall 1000
         assert_eq!(measured_bottleneck(&r, 0.0, 5.0), Bottleneck::Latency);
+    }
+
+    #[test]
+    fn counted_parse_surfaces_losses() {
+        // one good row, one truncated (data-shaped, short), one unparseable field;
+        // header/comment/blank lines are not losses.
+        let t = "op_index\top_kind\tlane\tgt_start_ns\tgt_end_ns\tcycles\tbytes\tops\n\
+                 # comment\n\
+                 \n\
+                 6\tMMVQ_Q4_0\tmem\t100\t200\t75282\t0\t0\n\
+                 7\tGEMV_F16\tmem\t100\t200\n\
+                 8\tGEMV_F16\tmem\t100\t200\tnot-a-number\t0\t0\n";
+        let (recs, skipped) = parse_tele_counted(t);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(skipped, 2);
+        // the delegating wrapper is loss-blind by design (call sites unchanged)
+        assert_eq!(parse_tele(t).len(), 1);
     }
 
     #[test]

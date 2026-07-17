@@ -512,7 +512,8 @@ fn shares(spec: &str) -> Result<(Vec<(String, f64)>, usize), String> {
         None => (spec, ".*"),
     };
     let sass = sass_text(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-    let (mix, matched) = loop_mix(&sass, &Pattern::new(regex));
+    let pat = Pattern::try_new(regex).map_err(|e| format!("census-match {}: {}\n", spec, e))?;
+    let (mix, matched) = loop_mix(&sass, &pat);
     if matched == 0 {
         return Err(format!("FAIL census-match: no kernels matched in {}\n", spec));
     }

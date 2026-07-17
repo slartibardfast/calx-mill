@@ -43,40 +43,42 @@ pub fn parse_records(text: &str) -> Vec<Vec<String>> {
     let mut field = String::new();
     let mut in_quotes = false;
     let mut field_started = false;
-    let bytes = text.as_bytes();
+    // char-wise (not byte-wise): multibyte UTF-8 passes through intact instead of
+    // being mangled to mojibake; behaviour is identical for ASCII input.
+    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
+    while i < chars.len() {
+        let c = chars[i];
         if in_quotes {
-            if c == b'"' {
-                if bytes.get(i + 1) == Some(&b'"') {
+            if c == '"' {
+                if chars.get(i + 1) == Some(&'"') {
                     field.push('"');
                     i += 1;
                 } else {
                     in_quotes = false;
                 }
             } else {
-                field.push(c as char);
+                field.push(c);
             }
         } else {
             match c {
-                b'"' => {
+                '"' => {
                     in_quotes = true;
                     field_started = true;
                 }
-                b',' => {
+                ',' => {
                     record.push(std::mem::take(&mut field));
                     field_started = true;
                 }
-                b'\r' => {}
-                b'\n' => {
+                '\r' => {}
+                '\n' => {
                     if field_started || !field.is_empty() || !record.is_empty() {
                         record.push(std::mem::take(&mut field));
                         records.push(std::mem::take(&mut record));
                     }
                     field_started = false;
                 }
-                _ => field.push(c as char),
+                _ => field.push(c),
             }
         }
         i += 1;
@@ -118,6 +120,16 @@ mod tests {
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0], ["1", "x,y", "3"]);
         assert_eq!(t.rows[1], ["4", "", "q\"q"]);
+    }
+
+    #[test]
+    fn non_ascii_utf8_roundtrips() {
+        // previously `c as char` on raw bytes mangled multibyte UTF-8 to mojibake
+        let t = Table::parse("name,note\nmüller,\"softmax≈exp², 10µs\"\n");
+        assert_eq!(t.rows[0], ["müller", "softmax≈exp², 10µs"]);
+        let mut s = String::new();
+        write_record(&mut s, &["müller", "10µs"]);
+        assert_eq!(s, "müller,10µs\r\n");
     }
 
     #[test]

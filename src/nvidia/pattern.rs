@@ -64,6 +64,29 @@ fn match_star(atom: Atom, rest: &[(Atom, Quant)], text: &[u8]) -> bool {
 }
 
 impl Pattern {
+    /// [`Pattern::new`] for OPERATOR-supplied patterns: reject the regex constructs
+    /// this engine does not implement instead of taking them as literals (a
+    /// `[0-9]`-style filter previously matched nothing, silently).
+    pub fn try_new(pat: &str) -> Result<Pattern, String> {
+        let bytes = pat.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1, // an escaped character is always a literal
+                c if br"[](){}|?^$".contains(&c) => {
+                    return Err(format!(
+                        "pattern {:?}: unsupported regex construct {:?} \
+                         (supported: literals, '.', '\\d', '*', '+')",
+                        pat, c as char
+                    ));
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(Pattern::new(pat))
+    }
+
     pub fn new(pat: &str) -> Pattern {
         let bytes = pat.as_bytes();
         let mut atoms = Vec::new();
@@ -121,5 +144,18 @@ mod tests {
         assert!(Pattern::new("fa_mini_kernelILi0").is_match("_ZN5tu10214fa_mini_kernelILi0EEEv"));
         assert!(Pattern::new("a\\d+b").is_match("xxa12byy"));
         assert!(!Pattern::new("a\\d+b").is_match("xxabyy"));
+    }
+
+    #[test]
+    fn try_new_rejects_unimplemented_constructs() {
+        assert!(Pattern::try_new("[0-9]").is_err());
+        assert!(Pattern::try_new("a|b").is_err());
+        assert!(Pattern::try_new("^anchor$").is_err());
+        assert!(Pattern::try_new("x{3}").is_err());
+        assert!(Pattern::try_new("a?").is_err());
+        // the supported subset still parses, and escapes stay literals
+        assert!(Pattern::try_new("fa_mini_kernelILi0").is_ok());
+        assert!(Pattern::try_new("inject_kernelINS_\\d*OpFFMAELi8E").is_ok());
+        assert!(Pattern::try_new("\\[literal\\]").is_ok());
     }
 }

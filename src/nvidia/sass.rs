@@ -90,6 +90,23 @@ fn scan_instr(line: &str) -> Option<(u64, usize, usize)> {
     None
 }
 
+/// Count instruction lines the scanner drops for carrying a UNIFORM-datapath
+/// predicate (`@UP0` / `@!UP0`): `scan_instr` refuses them by design (mirroring the
+/// reference tools), so they cost zero in every census — an opposite-signed silent
+/// error to `@P0`-predicated instructions counting at full cost. Surfaced so the
+/// drop is visible; the census CSV itself is unchanged (golden parity).
+pub fn uniform_predicated_drops(sass: &str) -> usize {
+    sass.lines()
+        .filter(|l| {
+            scan_instr(l).is_none()
+                && l.find("*/").is_some_and(|p| {
+                    let after = l[p + 2..].trim_start();
+                    after.starts_with("@UP") || after.starts_with("@!UP")
+                })
+        })
+        .count()
+}
+
 /// `check_sass.py::parse_functions`: (mangled name, decoded instructions) per
 /// function, in file order.
 pub fn parse_functions(sass: &str) -> Vec<(String, Vec<Instr>)> {

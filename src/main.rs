@@ -19,7 +19,8 @@ use calx_mill::validity::{
     Anchor, AnchorRow, Authority, DomainFit, Verdict, USAGE_EXIT,
 };
 use calx_mill::telemetry::{
-    measured_bottleneck, op_pipe_rate, overlap_fraction, parse_tele, TeleRecord,
+    measured_bottleneck, op_pipe_rate, overlap_fraction, parse_tele_counted, TeleRecord,
+    CLOCK_TOL_FRAC,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -52,6 +53,10 @@ commands:
       SMs; --block-smem overrides static smem with the dynamic launch value)
   ncu <export.csv>
       parse an `ncu --csv` metric export; achieved occupancy per launch
+  telemetry <file.tele> [--strict]
+      summarize the megakernel's on-device records: per-op wall, heavy hitters,
+      realized overlap; counts malformed rows, roofline (T1) and clock-implausible
+      rejects. --strict exits non-zero when any row was skipped.
   latency --chains C --depth D --cyc-per-op R --op-latency L
           [--reg-budget B --base-regs BR --regs-per-chain RC --spend S]
       the dependency-latency projection MII = max(C*D*R, D*L) (call/0028):
@@ -308,7 +313,7 @@ fn run() -> Result<i32, String> {
                 return Err("project: exactly one census CSV expected".into());
             };
             let table_path = args.value("table").ok_or("project: --table is required")?;
-            let kernel = Pattern::new(args.value("kernel").unwrap_or(".*"));
+            let kernel = Pattern::try_new(args.value("kernel").unwrap_or(".*"))?;
             let warps: f64 = args.number("warps", 8.0)?;
             let mem_class = MemClass::parse(args.value("mem-class").unwrap_or("none"))
                 .ok_or("--mem-class: none, dram, or l1")?;
@@ -345,8 +350,17 @@ fn run() -> Result<i32, String> {
             let [path] = args.positional.as_slice() else {
                 return Err("census: exactly one binary or .sass expected".into());
             };
-            let kernel = Pattern::new(args.value("kernel").unwrap_or(".*"));
+            let kernel = Pattern::try_new(args.value("kernel").unwrap_or(".*"))?;
             let sass = sass_text(Path::new(path)).map_err(|e| e.to_string())?;
+            // stderr, never stdout: the census CSV is golden-pinned byte for byte.
+            let drops = calx_mill::nvidia::sass::uniform_predicated_drops(&sass);
+            if drops > 0 {
+                eprintln!(
+                    "census: {} uniform-datapath predicated instructions dropped \
+                     (@UP*: refused by the scanner, costed at zero)",
+                    drops
+                );
+            }
             let counts = census_per_kernel(&sass, &kernel, args.has("full"));
             if counts.is_empty() {
                 eprintln!("no kernels matched '{}'", args.value("kernel").unwrap_or(".*"));
@@ -803,16 +817,27 @@ fn run() -> Result<i32, String> {
             // (the measurement no external profiler yields). bytes/ops==0 records show
             // no MemoryBw/Pipe column yet (attached in a later pass), so the memory
             // classification is reported only where bytes are present.
-            let path = rest.first().ok_or("telemetry: need a .tele file path")?;
+            let args = Args::parse(rest, &[])?;
+            let path = args
+                .positional
+                .first()
+                .ok_or("telemetry: need a .tele file path")?;
+            let strict = args.has("strict");
             let text = read(path)?;
-            let recs = parse_tele(&text);
+            let (recs, skipped) = parse_tele_counted(&text);
+            if skipped > 0 {
+                eprintln!(
+                    "telemetry: {} malformed rows skipped (truncated/corrupt input)",
+                    skipped
+                );
+            }
             if recs.is_empty() {
                 return Err(format!("{}: no telemetry records parsed", path));
             }
             let n_bad: usize = recs.iter().filter(|r| !r.roofline_ok()).count();
             let n_clock: usize = recs
                 .iter()
-                .filter(|r| !r.clock_plausible(calx_mill::telemetry::CLOCK_TOL_FRAC))
+                .filter(|r| !r.clock_plausible(CLOCK_TOL_FRAC))
                 .count();
             let n_bytes: usize = recs.iter().filter(|r| r.bytes > 0).count();
             let sum_cyc: u64 = recs.iter().map(|r| r.cycles).sum();
@@ -890,7 +915,8 @@ fn run() -> Result<i32, String> {
                     overlapped
                 );
             }
-            Ok(0)
+            // --strict: a lossy parse is a failed run, not a footnote.
+            Ok(if strict && skipped > 0 { 1 } else { 0 })
         }
         "--help" | "-h" | "help" => {
             println!("{}", USAGE);
