@@ -1,0 +1,4 @@
+id,measured,tol,tol_kind,units,at,domain
+mmvq-deep-us,68.19,20,rel,us,ctx=4096;batch=1,ctx=1..8192;batch=1..1
+fullstack-kl-naive-f16,0.0200,10,rel,kl,limbs=1;stack=full,limbs=1..1;stack=full
+fullstack-kl-2limb,0.01836,0.0005,abs,kl,limbs=2;stack=full,limbs=2..2;stack=full

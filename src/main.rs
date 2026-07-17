@@ -14,7 +14,10 @@ use calx_mill::nvidia::table::Rates;
 use calx_mill::nvidia::verify::verify_projection;
 use calx_mill::{blocks_per_instance, concurrency, cooperative_fits, occupancy_pct};
 use calx_mill::{achievable_chains, Bottleneck, Lane, OpComposition, OpTemplate, Phase};
-use calx_mill::validity::{authority, verdict, Anchor, DomainFit, Verdict};
+use calx_mill::validity::{
+    authority, compose as compose_authority, computed_fit, exit_code, parse_registry, verdict,
+    Anchor, AnchorRow, Authority, DomainFit, Verdict, USAGE_EXIT,
+};
 use calx_mill::telemetry::{
     measured_bottleneck, op_pipe_rate, overlap_fraction, parse_tele, TeleRecord,
 };
@@ -69,13 +72,19 @@ commands:
       register-prefetch (spend > headroom) falls back to serial. e.g. FATTN deep:
       --mem-cycles 1413 --compute-cycles 1945 -> serial 3358, overlapped 1945.
 
-  gate --value V --anchor M --tol T [--at-anchor A] --fit at-anchor|in-domain|out-of-domain
-      projection-validity ARBITER (plan/0144/spec/projection-validity.md): judge a claim
-      against its measured anchor + domain and emit CERTIFIED (Gate) | PROVISIONAL
-      (CrossChecked -- build, bench confirms) | REFUSED (Advisory -- exit 2, the bench gates).
-      `anchored` = the model's value AT the anchor (--at-anchor, default V) reproduces M±T.
-      Makes an unvalidated projection un-launderable into a pass. e.g. a KL claim of 1.8e-7
-      against anchor 0.02 --fit out-of-domain -> REFUSED.
+  gate --value V --anchor M (--tol T | --tol-rel PCT) --fit-override FIT [--units U]
+  gate --value V --registry FILE --anchor-id ID --at k=v,... [--fit-override FIT]
+  gate --compose VERDICT,VERDICT [composite anchor flags as above]
+      projection-validity ARBITER (plan/0144/spec/projection-validity.md; contract
+      call/0036): judge a claim against its measured anchor + domain and emit
+      CERTIFIED (exit 0) | PROVISIONAL (exit 3 -- build, bench confirms, NOT a
+      terminal pass) | REFUSED (exit 2, the bench gates); operator error exits 4.
+      `anchored` = the model's value AT the anchor (--at-anchor, default V)
+      reproduces M±T. In registry mode the domain FIT is COMPUTED from the row
+      (an unknown or missing axis is out-of-domain); --fit-override substitutes
+      it and tags the verdict `[fit-override]`. --compose runs the A4 cap: the
+      composite keeps Gate only if it reproduces its OWN anchor. Makes an
+      unvalidated projection un-launderable into a pass.
 
 kernel PAT is the subset the tools use: literals, '.', '\\d', with '*'/'+'.
 Binaries are disassembled via cuobjdump (override with CUOBJDUMP); .sass
@@ -130,6 +139,147 @@ impl Args {
             Some(v) => v.parse().map_err(|_| format!("--{}: bad value {:?}", name, v)),
         }
     }
+}
+
+const GATE_USAGE: &str = "\
+usage: calx-mill gate --value V --anchor M (--tol T | --tol-rel PCT) --fit-override FIT
+       calx-mill gate --value V --registry FILE --anchor-id ID --at k=v,...
+       calx-mill gate --compose VERDICT,VERDICT [composite anchor flags as above]
+FIT is at-anchor|in-domain|out-of-domain. Registry mode COMPUTES the fit from the
+row's domain (--fit-override substitutes it and tags the verdict [fit-override]).
+exits: 0 CERTIFIED, 3 PROVISIONAL, 2 REFUSED, 4 usage (never adjudicated).";
+
+/// A resolved anchor source for `gate`: from the registry (fit computed) or the
+/// manual flags (fit operator-declared via --fit-override). `Err` is a usage message.
+struct GateAnchor {
+    anchor: Anchor,
+    fit: DomainFit,
+    computed: Option<DomainFit>, // Some(..) in registry mode
+    overridden: bool,
+    units: String,
+    id: String, // registry row id; empty in manual mode
+}
+
+fn parse_fit(s: &str) -> Option<DomainFit> {
+    match s {
+        "at-anchor" => Some(DomainFit::AtAnchor),
+        "in-domain" => Some(DomainFit::InDomain),
+        "out-of-domain" | "out" => Some(DomainFit::OutOfDomain),
+        _ => None,
+    }
+}
+
+fn fit_name(f: DomainFit) -> &'static str {
+    match f {
+        DomainFit::AtAnchor => "at-anchor",
+        DomainFit::InDomain => "in-domain",
+        DomainFit::OutOfDomain => "out-of-domain",
+    }
+}
+
+fn parse_query(at: &str) -> Result<Vec<(String, String)>, String> {
+    let mut query = Vec::new();
+    for part in at.split(',').filter(|p| !p.is_empty()) {
+        let Some((k, v)) = part.split_once('=') else {
+            return Err(format!("--at: {:?} is not key=value", part));
+        };
+        query.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    if query.is_empty() {
+        return Err("--at needs at least one key=value".into());
+    }
+    Ok(query)
+}
+
+/// Resolve `gate`'s anchor source. `Ok(None)` = no anchor flags at all (legal only
+/// under --compose); `Err` = an operator/usage error (exit 4 at the caller).
+fn resolve_gate_anchor(args: &Args) -> Result<Option<GateAnchor>, String> {
+    let registry_mode =
+        args.has("registry") || args.has("anchor-id") || args.has("at");
+    if registry_mode {
+        for conflicting in ["anchor", "tol", "tol-rel"] {
+            if args.has(conflicting) {
+                return Err(format!(
+                    "--{} conflicts with --registry (one source of truth)",
+                    conflicting
+                ));
+            }
+        }
+        let (Some(file), Some(id), Some(at)) =
+            (args.value("registry"), args.value("anchor-id"), args.value("at"))
+        else {
+            return Err("registry mode needs --registry, --anchor-id, and --at".into());
+        };
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| format!("--registry {}: {}", file, e))?;
+        let rows = parse_registry(&text)?;
+        let row: AnchorRow = rows
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| format!("--anchor-id {:?} not in {}", id, file))?;
+        let query = parse_query(at)?;
+        let computed = computed_fit(&row, &query);
+        let (fit, overridden) = match args.value("fit-override") {
+            Some(s) => {
+                let f = parse_fit(s).ok_or_else(|| {
+                    format!("--fit-override: {:?} (at-anchor|in-domain|out-of-domain)", s)
+                })?;
+                (f, true)
+            }
+            None => (computed, false),
+        };
+        return Ok(Some(GateAnchor {
+            anchor: row.anchor,
+            fit,
+            computed: Some(computed),
+            overridden,
+            units: row.units,
+            id: row.id,
+        }));
+    }
+    let any_manual = args.has("anchor") || args.has("tol") || args.has("tol-rel")
+        || args.has("fit-override");
+    if !any_manual {
+        return Ok(None);
+    }
+    let Some(measured) = args.value("anchor") else {
+        return Err("manual mode needs --anchor".into());
+    };
+    let measured: f64 = measured
+        .parse()
+        .map_err(|_| format!("--anchor: bad value {:?}", measured))?;
+    let tol = match (args.value("tol"), args.value("tol-rel")) {
+        (Some(_), Some(_)) => return Err("--tol and --tol-rel are exclusive".into()),
+        (None, None) => return Err("manual mode needs --tol or --tol-rel".into()),
+        (Some(t), None) => {
+            let t: f64 = t.parse().map_err(|_| format!("--tol: bad value {:?}", t))?;
+            if t < 0.0 {
+                return Err("--tol must be non-negative".into());
+            }
+            t
+        }
+        (None, Some(p)) => {
+            let p: f64 = p.parse().map_err(|_| format!("--tol-rel: bad value {:?}", p))?;
+            if p < 0.0 {
+                return Err("--tol-rel must be non-negative".into());
+            }
+            p / 100.0 * measured.abs()
+        }
+    };
+    let Some(fit) = args.value("fit-override") else {
+        return Err("manual mode needs --fit-override (there is no computed fit)".into());
+    };
+    let fit = parse_fit(fit).ok_or_else(|| {
+        format!("--fit-override: {:?} (at-anchor|in-domain|out-of-domain)", fit)
+    })?;
+    Ok(Some(GateAnchor {
+        anchor: Anchor { measured, tol },
+        fit,
+        computed: None,
+        overridden: true, // manual fit is by definition operator-declared
+        units: args.value("units").unwrap_or("").to_string(),
+        id: String::new(),
+    }))
 }
 
 fn run() -> Result<i32, String> {
@@ -482,47 +632,169 @@ fn run() -> Result<i32, String> {
             Ok(0)
         }
         "gate" => {
-            // projection-validity ARBITER (plan/0144/spec/projection-validity.md): judge one
-            // claim against its anchor + domain and emit CERTIFIED | PROVISIONAL | REFUSED.
-            // The tool adjudicates; the agent attaches the verdict, never overrides it.
+            // projection-validity ARBITER (plan/0144/spec/projection-validity.md; process
+            // contract host call/0036): judge one claim against its anchor + domain and
+            // emit CERTIFIED (0) | PROVISIONAL (3) | REFUSED (2); an operator error is
+            // USAGE (4) — the arbiter never adjudicated. The tool adjudicates; the agent
+            // attaches the verdict, never overrides it.
             let args = Args::parse(
                 rest,
-                &["value", "anchor", "tol", "at-anchor", "fit"],
+                &["value", "anchor", "tol", "tol-rel", "at-anchor", "units",
+                  "registry", "anchor-id", "at", "fit-override", "compose"],
             )?;
-            let value = args.number::<f64>("value", 0.0)?;
-            let measured = args.number::<f64>("anchor", 0.0)?;
-            let tol = args.number::<f64>("tol", 0.0)?;
-            let at_anchor = args.number::<f64>("at-anchor", value)?; // model's value AT the anchor
-            let fit = match args.value("fit").unwrap_or("in-domain") {
-                "at-anchor" => DomainFit::AtAnchor,
-                "in-domain" => DomainFit::InDomain,
-                "out-of-domain" | "out" => DomainFit::OutOfDomain,
-                other => return Err(format!("--fit must be at-anchor|in-domain|out-of-domain, got {:?}", other)),
+            let usage = |msg: String| -> Result<i32, String> {
+                eprintln!("calx-mill gate: {}", msg);
+                eprintln!("{}", GATE_USAGE);
+                Ok(USAGE_EXIT as i32)
             };
-            let anchor = Anchor { measured, tol };
-            let anchored = anchor.reproduces(at_anchor);
-            let a = authority(anchored, fit);
-            match verdict(a) {
-                Verdict::Certified => {
-                    println!("CERTIFIED value={} (Gate: reproduces anchor {}±{} at this query)",
-                             value, measured, tol);
-                    Ok(0)
+            // Every gate flag takes a value, so a valueless (unknown) flag or a stray
+            // positional is an operator error — closing the silent-boolean fallthrough
+            // that let `--anchor-id` be ignored and defaults adjudicate.
+            if let Some((k, _)) = args.flags.iter().find(|(_, v)| v.is_none()) {
+                return usage(format!("unknown flag --{}", k));
+            }
+            if let Some(p) = args.positional.first() {
+                return usage(format!("unexpected argument {:?}", p));
+            }
+            let ga = match resolve_gate_anchor(&args) {
+                Err(msg) => return usage(msg),
+                Ok(ga) => ga,
+            };
+            // --compose VERDICT,VERDICT: A4 composition. The composite keeps the meet
+            // (may stay Gate) only when the composite claim itself earns Gate from its
+            // own anchor in this same invocation; else capped at CrossChecked.
+            if let Some(spec) = args.value("compose") {
+                let parse_verdict = |s: &str| match s.to_ascii_lowercase().as_str() {
+                    "certified" => Some(Authority::Gate),
+                    "provisional" => Some(Authority::CrossChecked),
+                    "refused" => Some(Authority::Advisory),
+                    _ => None,
+                };
+                let Some((sa, sb)) = spec.split_once(',') else {
+                    return usage("--compose needs VERDICT,VERDICT".into());
+                };
+                let (Some(ta), Some(tb)) = (parse_verdict(sa.trim()), parse_verdict(sb.trim()))
+                else {
+                    return usage(format!(
+                        "--compose: verdicts are certified|provisional|refused, got {:?}",
+                        spec
+                    ));
+                };
+                let composite_anchored = match &ga {
+                    None => false,
+                    Some(ga) => {
+                        let Some(value) = args.value("value") else {
+                            return usage("a composite anchor needs --value".into());
+                        };
+                        let Ok(value) = value.parse::<f64>() else {
+                            return usage(format!("--value: bad value {:?}", value));
+                        };
+                        let at_anchor = match args.value("at-anchor") {
+                            None => value,
+                            Some(s) => match s.parse::<f64>() {
+                                Ok(x) => x,
+                                Err(_) => {
+                                    return usage(format!("--at-anchor: bad value {:?}", s))
+                                }
+                            },
+                        };
+                        authority(ga.anchor.reproduces(at_anchor), ga.fit) == Authority::Gate
+                    }
+                };
+                let v = verdict(compose_authority(ta, tb, composite_anchored));
+                let name = match v {
+                    Verdict::Certified => "CERTIFIED (re-anchored composite)",
+                    Verdict::Provisional => {
+                        "PROVISIONAL (A4: composition is capped below Gate -- the \
+                         interaction is unvalidated; the bench confirms)"
+                    }
+                    Verdict::Refused => "REFUSED (the meet includes an Advisory input)",
+                };
+                println!("COMPOSED: {}", name);
+                return Ok(exit_code(v) as i32);
+            }
+            // Single-claim adjudication.
+            let Some(ga) = ga else {
+                return usage(
+                    "need an anchor source: --anchor (--tol|--tol-rel) --fit-override FIT, \
+                     or --registry FILE --anchor-id ID --at k=v,..."
+                        .into(),
+                );
+            };
+            let Some(value) = args.value("value") else {
+                return usage("need --value (the claim being judged)".into());
+            };
+            let Ok(value) = value.parse::<f64>() else {
+                return usage(format!("--value: bad value {:?}", value));
+            };
+            let at_anchor = match args.value("at-anchor") {
+                None => value, // model's value AT the anchor defaults to the claim
+                Some(s) => match s.parse::<f64>() {
+                    Ok(x) => x,
+                    Err(_) => return usage(format!("--at-anchor: bad value {:?}", s)),
+                },
+            };
+            // A claim speaking different units than its anchor is a failed adjudication
+            // (REFUSED), not a usage slip: the number cannot mean what the anchor means.
+            if let (Some(u), false) = (args.value("units"), ga.units.is_empty()) {
+                if u != ga.units {
+                    println!(
+                        "REFUSED: claim units {:?} do not match anchor units {:?} \
+                         -> the bench/oracle gates, not the model.",
+                        u, ga.units
+                    );
+                    return Ok(exit_code(Verdict::Refused) as i32);
                 }
-                Verdict::Provisional => {
-                    println!("PROVISIONAL value={} (CrossChecked: anchored model, extrapolated \
-                              -- decide/build on it, the bench confirms; NOT a terminal gate)", value);
-                    Ok(0)
+            }
+            if let Some(computed) = ga.computed {
+                if ga.overridden {
+                    println!(
+                        "fit: {} (computed) -> {} (OPERATOR OVERRIDE)",
+                        fit_name(computed),
+                        fit_name(ga.fit)
+                    );
+                } else {
+                    println!(
+                        "fit: {} (computed from registry row {:?})",
+                        fit_name(computed),
+                        ga.id
+                    );
                 }
+            }
+            let tag = if ga.overridden { " [fit-override]" } else { "" };
+            let units = if ga.units.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", ga.units)
+            };
+            let anchored = ga.anchor.reproduces(at_anchor);
+            let v = verdict(authority(anchored, ga.fit));
+            match v {
+                Verdict::Certified => println!(
+                    "CERTIFIED value={} (Gate: reproduces anchor {}±{}{} at this query){}",
+                    value, ga.anchor.measured, ga.anchor.tol, units, tag
+                ),
+                Verdict::Provisional => println!(
+                    "PROVISIONAL value={} (CrossChecked: anchored model, extrapolated \
+                     -- decide/build on it, the bench confirms; NOT a terminal gate){}",
+                    value, tag
+                ),
                 Verdict::Refused => {
                     let why = if !anchored {
-                        format!("does not reproduce anchor {}±{} (got {})", measured, tol, at_anchor)
+                        format!(
+                            "does not reproduce anchor {}±{}{} (got {})",
+                            ga.anchor.measured, ga.anchor.tol, units, at_anchor
+                        )
                     } else {
                         "out of the anchored domain".to_string()
                     };
-                    println!("REFUSED: {} -> the bench/oracle gates, not the model.", why);
-                    Ok(2)   // non-zero: an unvalidated projection cannot be laundered into a pass
+                    println!(
+                        "REFUSED: {} -> the bench/oracle gates, not the model.{}",
+                        why, tag
+                    );
                 }
             }
+            Ok(exit_code(v) as i32)
         }
         "telemetry" => {
             // plan/0144 primitive-telemetry ingest: read the megakernel's on-device

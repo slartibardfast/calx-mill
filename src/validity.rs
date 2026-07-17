@@ -95,6 +95,160 @@ pub fn verdict(a: Authority) -> Verdict {
     }
 }
 
+/// The `gate` process exit code per verdict — the contract a gate manifest keys on
+/// (host `call/0036`). Pairwise distinct: PROVISIONAL is not a terminal pass and must
+/// not share CERTIFIED's 0; REFUSED keeps 2 (the established no-launder exit).
+pub fn exit_code(v: Verdict) -> u8 {
+    match v {
+        Verdict::Certified => 0,
+        Verdict::Refused => 2,
+        Verdict::Provisional => 3,
+    }
+}
+
+/// `gate` operator/usage error: the arbiter never adjudicated (missing or unknown
+/// flag, malformed registry or `--at`, conflicting tolerance forms, negative tol).
+pub const USAGE_EXIT: u8 = 4;
+
+/// One axis bound of an anchor's validated domain: a closed numeric range
+/// (`ctx=1..8192`) or an exact value (`dtype=q4_0`, string-compared).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DomainBound {
+    Range(f64, f64),
+    Exact(String),
+}
+
+/// One registry row (spec A5 realized): a measured anchor plus its own query point
+/// (`at`) and the domain it validates. `anchor.tol` is stored resolved-absolute
+/// (a `rel` tolerance is resolved against `measured` at load).
+#[derive(Clone, Debug)]
+pub struct AnchorRow {
+    pub id: String,
+    pub anchor: Anchor,
+    pub units: String,
+    pub at: Vec<(String, String)>,
+    pub domain: Vec<(String, DomainBound)>,
+}
+
+fn parse_kv(field: &str, what: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for part in field.split(';').filter(|p| !p.is_empty()) {
+        let (k, v) = part
+            .split_once('=')
+            .ok_or_else(|| format!("{}: {:?} is not key=value", what, part))?;
+        out.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    Ok(out)
+}
+
+/// Parse the anchor registry CSV: columns
+/// `id,measured,tol,tol_kind,units,at,domain` with `at` = `key=value;...` and
+/// `domain` = `key=lo..hi;...` (inclusive) or `key=value` (exact). A duplicate id,
+/// a negative tolerance, or an unknown `tol_kind` is a load error — never a default.
+/// (The CSV reader is the adapter layer's `csvio`; it is substrate-neutral, imported
+/// here so the registry format has exactly one parser.)
+pub fn parse_registry(text: &str) -> Result<Vec<AnchorRow>, String> {
+    let t = crate::nvidia::csvio::Table::parse(text);
+    for need in ["id", "measured", "tol", "tol_kind", "units", "at", "domain"] {
+        if !t.header.iter().any(|h| h == need) {
+            return Err(format!("registry: missing column {:?}", need));
+        }
+    }
+    let (ci, cm, ct, ck, cu, ca, cd) = (
+        t.col("id"), t.col("measured"), t.col("tol"), t.col("tol_kind"),
+        t.col("units"), t.col("at"), t.col("domain"),
+    );
+    let mut rows: Vec<AnchorRow> = Vec::new();
+    for r in &t.rows {
+        let id = r[ci].clone();
+        if rows.iter().any(|x| x.id == id) {
+            return Err(format!("registry: duplicate id {:?}", id));
+        }
+        let measured: f64 = r[cm]
+            .parse()
+            .map_err(|_| format!("registry {}: bad measured {:?}", id, r[cm]))?;
+        let tol_raw: f64 = r[ct]
+            .parse()
+            .map_err(|_| format!("registry {}: bad tol {:?}", id, r[ct]))?;
+        if tol_raw < 0.0 {
+            return Err(format!("registry {}: negative tol", id));
+        }
+        let tol = match r[ck].as_str() {
+            "abs" => tol_raw,
+            "rel" => tol_raw / 100.0 * measured.abs(),
+            other => return Err(format!("registry {}: tol_kind {:?} (abs|rel)", id, other)),
+        };
+        let mut domain = Vec::new();
+        for (k, v) in parse_kv(&r[cd], &format!("registry {} domain", id))? {
+            let bound = match v.split_once("..") {
+                Some((lo, hi)) => {
+                    let lo: f64 = lo.trim().parse()
+                        .map_err(|_| format!("registry {}: bad range {:?}", id, v))?;
+                    let hi: f64 = hi.trim().parse()
+                        .map_err(|_| format!("registry {}: bad range {:?}", id, v))?;
+                    DomainBound::Range(lo, hi)
+                }
+                None => DomainBound::Exact(v),
+            };
+            domain.push((k, bound));
+        }
+        rows.push(AnchorRow {
+            id,
+            anchor: Anchor { measured, tol },
+            units: r[cu].clone(),
+            at: parse_kv(&r[ca], "registry at")?,
+            domain,
+        });
+    }
+    Ok(rows)
+}
+
+fn value_eq(a: &str, b: &str) -> bool {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// A2/A5 made mechanical: the fit is COMPUTED from the registry row, never typed.
+/// A query key the domain does not cover, a domain key the query does not supply,
+/// or a value outside its bound is `OutOfDomain` (membership unverifiable is
+/// non-membership); the anchor's own query point is `AtAnchor`; else `InDomain`.
+pub fn computed_fit(row: &AnchorRow, query: &[(String, String)]) -> DomainFit {
+    for (k, _) in query {
+        if !row.domain.iter().any(|(dk, _)| dk == k) {
+            return DomainFit::OutOfDomain; // an axis the anchor never covered
+        }
+    }
+    for (dk, bound) in &row.domain {
+        let Some((_, qv)) = query.iter().find(|(k, _)| k == dk) else {
+            return DomainFit::OutOfDomain; // unverifiable axis
+        };
+        match bound {
+            DomainBound::Range(lo, hi) => {
+                let Ok(x) = qv.parse::<f64>() else { return DomainFit::OutOfDomain };
+                if x < *lo || x > *hi {
+                    return DomainFit::OutOfDomain;
+                }
+            }
+            DomainBound::Exact(s) => {
+                if !value_eq(qv, s) {
+                    return DomainFit::OutOfDomain;
+                }
+            }
+        }
+    }
+    let at_anchor = query.len() == row.at.len()
+        && query
+            .iter()
+            .all(|(k, v)| row.at.iter().any(|(ak, av)| ak == k && value_eq(av, v)));
+    if at_anchor {
+        DomainFit::AtAnchor
+    } else {
+        DomainFit::InDomain
+    }
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -201,5 +355,78 @@ mod tests {
         let two_limb = Anchor { measured: 0.01836, tol: 0.0005 };
         assert!(two_limb.reproduces(0.0184));
         assert!(!two_limb.reproduces(0.0200));                  // naive-f16 does not
+    }
+
+    #[test]
+    fn exit_codes_pairwise_distinct() {
+        let codes = [
+            exit_code(Verdict::Certified),
+            exit_code(Verdict::Provisional),
+            exit_code(Verdict::Refused),
+        ];
+        assert_eq!(codes, [0, 3, 2]);
+        assert!(codes[0] != codes[1] && codes[1] != codes[2] && codes[0] != codes[2]);
+        assert!(!codes.contains(&USAGE_EXIT)); // operator error is its own lane
+    }
+
+    const REGISTRY: &str = "\
+id,measured,tol,tol_kind,units,at,domain\n\
+mmvq-deep-us,68.19,20,rel,us,ctx=4096;batch=1,ctx=1..8192;batch=1..1\n\
+fullstack-kl-naive-f16,0.0200,10,rel,kl,limbs=1;stack=full,limbs=1..1;stack=full\n";
+
+    fn q(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn registry_loads_and_resolves_rel_tol() {
+        let rows = parse_registry(REGISTRY).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "mmvq-deep-us");
+        assert!((rows[0].anchor.tol - 13.638).abs() < 1e-9); // 20% of 68.19
+        assert_eq!(rows[0].units, "us");
+        assert_eq!(rows[0].domain[0], ("ctx".to_string(), DomainBound::Range(1.0, 8192.0)));
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_and_negative() {
+        let dup = format!("{}mmvq-deep-us,1,1,abs,us,ctx=1,ctx=1..2\n", REGISTRY);
+        assert!(parse_registry(&dup).is_err());
+        let neg = "id,measured,tol,tol_kind,units,at,domain\nx,1,-1,abs,,,\n";
+        assert!(parse_registry(neg).is_err());
+        let kind = "id,measured,tol,tol_kind,units,at,domain\nx,1,1,pct,,,\n";
+        assert!(parse_registry(kind).is_err());
+    }
+
+    #[test]
+    fn fit_is_mechanical() {
+        let rows = parse_registry(REGISTRY).unwrap();
+        let r = &rows[0];
+        assert_eq!(computed_fit(r, &q(&[("ctx", "4096"), ("batch", "1")])), AtAnchor);
+        assert_eq!(computed_fit(r, &q(&[("ctx", "2048"), ("batch", "1")])), InDomain);
+        assert_eq!(computed_fit(r, &q(&[("ctx", "100000"), ("batch", "1")])), OutOfDomain);
+        // an axis the anchor never covered:
+        assert_eq!(
+            computed_fit(r, &q(&[("ctx", "4096"), ("batch", "1"), ("gpus", "2")])),
+            OutOfDomain
+        );
+        // an unverifiable axis (domain key missing from the query):
+        assert_eq!(computed_fit(r, &q(&[("ctx", "4096")])), OutOfDomain);
+        // a non-numeric value against a range:
+        assert_eq!(computed_fit(r, &q(&[("ctx", "deep"), ("batch", "1")])), OutOfDomain);
+    }
+
+    // The 10^5 case end-to-end with NO operator honesty: the claim is at the anchor's
+    // own query point, but fails A1 against the recorded measured value -> Refused.
+    #[test]
+    fn registry_refuses_the_op_precision_launder() {
+        let rows = parse_registry(REGISTRY).unwrap();
+        let r = &rows[1];
+        let query = q(&[("limbs", "1"), ("stack", "full")]);
+        let fit = computed_fit(r, &query);
+        assert_eq!(fit, AtAnchor);
+        let anchored = r.anchor.reproduces(1e-7);
+        assert!(!anchored);
+        assert_eq!(verdict(authority(anchored, fit)), Verdict::Refused);
     }
 }
