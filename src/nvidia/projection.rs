@@ -36,9 +36,20 @@ const OP_TABLE_ROW: &[(&str, &str)] = &[
     ("HADD2", "cvt.f2f.tput"),
     ("F2I", "cvt.i2f_f2i.tput"),
     ("I2F", "cvt.i2f_f2i.tput"),
+    ("HMMA", "tensor.hmma.1688.tput"),
+    ("IMMA", "tensor.imma.8816.tput"),
 ];
 
+/// Turing tensor-pipe rate in warpinst/SM/clk (PAPER.md tab:tensor, m16n8k8) — the
+/// unmeasured-table default for the `tensor` pipe, and the one constant the
+/// telemetry side's GPU-global HMMA denominator is derived from (the two halves
+/// must not disagree about what a tensor op costs).
+pub const TENSOR_HMMA_PER_SM_CLK: f64 = 0.5;
+
 const PIPE_OF: &[(&str, &str)] = &[
+    ("HMMA", "tensor"),
+    ("IMMA", "tensor"),
+    ("BMMA", "tensor"),
     ("FFMA", "fma"),
     ("FADD", "fma"),
     ("FMUL", "fma"),
@@ -204,6 +215,18 @@ pub fn project(
             let b = mem_bytes(mn) * 32; // per warp
             if base == "LDS" || base == "STS" {
                 smem_cycles += *n as f64 * (1.0 / lds_inst_rate(mem_bytes(mn)));
+            } else if base == "LDSM" {
+                // ldmatrix moves SHARED-memory tiles (not DRAM): 128 B/warp per 8x8
+                // b16 matrix, x1/x2/x4 by the trailing count suffix, so 4*count
+                // B/thread against the same 64 B/clk/SM smem ceiling. x4 -> 8
+                // cyc/inst, reproducing the measured `tensor.ldsm.tput` 0.125.
+                let count = mn
+                    .rsplit('.')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|c| matches!(c, 1 | 2 | 4))
+                    .unwrap_or(1);
+                smem_cycles += *n as f64 * (1.0 / lds_inst_rate(4 * count));
             } else if base == "LDL" || base == "STL" {
                 defaulted.push(mn.clone()); // local traffic: flagged, not modelled
             } else {
@@ -211,8 +234,24 @@ pub fn project(
             }
             continue;
         }
-        let measured = lookup(OP_TABLE_ROW, base).and_then(|id| rates.get(id));
-        let (pipe, rate) = match measured {
+        // Tensor mnemonics carry their MMA shape (`HMMA.1688.F32`); a measured row
+        // for that exact shape wins, an unmeasured shape falls back to the base-shape
+        // row with a `defaulted` marker (costed, but flagged as approximate).
+        let tensor_shape = if base == "HMMA" || base == "IMMA" {
+            mn.split('.')
+                .nth(1)
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        } else {
+            None
+        };
+        let shape_measured = tensor_shape.and_then(|shape| {
+            rates.get(&format!("tensor.{}.{}.tput", base.to_ascii_lowercase(), shape))
+        });
+        let base_measured = lookup(OP_TABLE_ROW, base).and_then(|id| rates.get(id));
+        if shape_measured.is_none() && tensor_shape.is_some() && base_measured.is_some() {
+            defaulted.push(mn.clone()); // tensor shape without its own measured row
+        }
+        let (pipe, rate) = match shape_measured.or(base_measured) {
             Some(r) => {
                 let rate: f64 = r.value.parse().expect("rate value parses");
                 let pipe = if r.pipe.is_empty() {
@@ -224,7 +263,13 @@ pub fn project(
             }
             None => {
                 let pipe = lookup(PIPE_OF, base).unwrap_or("alu");
-                let rate = if pipe == "fma" || pipe == "alu" { 2.0 } else { 0.5 };
+                let rate = if pipe == "fma" || pipe == "alu" {
+                    2.0
+                } else if pipe == "tensor" {
+                    TENSOR_HMMA_PER_SM_CLK
+                } else {
+                    0.5
+                };
                 defaulted.push(mn.clone());
                 (pipe.to_string(), rate)
             }

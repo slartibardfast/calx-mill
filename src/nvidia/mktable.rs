@@ -429,6 +429,8 @@ pub fn mk_table(
                     &deviation,
                     &flag,
                     &measured_by,
+                    // the stamped clock (telemetry::STAMPED_CLOCK_GHZ) as an integer
+                    // MHz string; kept literal for the byte-for-byte golden
                     "1455",
                     &all_notes,
                 ],

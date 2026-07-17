@@ -810,18 +810,30 @@ fn run() -> Result<i32, String> {
                 return Err(format!("{}: no telemetry records parsed", path));
             }
             let n_bad: usize = recs.iter().filter(|r| !r.roofline_ok()).count();
+            let n_clock: usize = recs
+                .iter()
+                .filter(|r| !r.clock_plausible(calx_mill::telemetry::CLOCK_TOL_FRAC))
+                .count();
             let n_bytes: usize = recs.iter().filter(|r| r.bytes > 0).count();
             let sum_cyc: u64 = recs.iter().map(|r| r.cycles).sum();
+            // ms from each record's own effective clock (derived-else-stamped), so a
+            // plausible DVFS excursion converts honestly instead of at the stamp.
+            let sum_ms: f64 = recs
+                .iter()
+                .map(|r| r.cycles as f64 / (r.effective_clock_ghz() * 1.0e9) * 1e3)
+                .sum();
             let sum_span: u64 = recs.iter().map(|r| r.span_ns()).sum();
             println!(
-                "telemetry: {} op records; Σcycles {} ({:.3} ms @1.455GHz); Σgt-span {:.3} ms; \
-                 {} with bytes; {} roofline-violating (T1 reject)",
+                "telemetry: {} op records; Σcycles {} ({:.3} ms, per-record derived-else-stamped \
+                 clock); Σgt-span {:.3} ms; {} with bytes; {} roofline-violating (T1 reject); \
+                 {} clock-implausible (stamped fallback, no anchor)",
                 recs.len(),
                 sum_cyc,
-                sum_cyc as f64 / 1.455e9 * 1e3,
+                sum_ms,
                 sum_span as f64 / 1e6,
                 n_bytes,
-                n_bad
+                n_bad,
+                n_clock
             );
             // Heavy hitters by measured wall.
             let mut idx: Vec<usize> = (0..recs.len()).collect();
