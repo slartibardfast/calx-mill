@@ -14,29 +14,70 @@
 use crate::validity::Verdict;
 use crate::{select_bound, Bottleneck, Lane, ResourceKind, SteadyState};
 
-/// The stamped SM clock in GHz — the single source for every cycle<->ns conversion
-/// and clock-derived constant here (it was previously three inline 1.455 literals).
-/// Per-record conversions prefer the DERIVED clock when plausible; this stamp is
-/// the fallback and the plausibility reference. See [`TeleRecord::effective_clock_ghz`].
-pub const STAMPED_CLOCK_GHZ: f64 = 1.455;
-
-/// Fractional tolerance for a record's derived clock against the stamp: outside it
-/// the record is clock-implausible (counted, stamped-clock fallback, no anchor).
+/// Fractional tolerance for a record's derived clock against the RUN CONSENSUS
+/// ([`run_clock_ghz`]): outside it the record is clock-implausible (counted,
+/// consensus-clock fallback, no anchor).
 pub const CLOCK_TOL_FRAC: f64 = 0.05;
 
-/// DRAM roofline as bytes moved per SM-clock cycle: 609 GB/s at the stamped clock,
-/// GPU-global (a record's `bytes` is the op's whole DRAM traffic). Provenance: TU102
-/// spec bandwidth / SM clock; consistent with the out-of-band `nvidia-smi dmon`
-/// mem-controller-77%-busy observation (plan/0143 capture). The numerator that turns
-/// measured bytes into a `MemoryBw` cycle demand and bounds T1.
-pub const PEAK_DRAM_BYTES_PER_CYCLE: f64 = 609.0e9 / (STAMPED_CLOCK_GHZ * 1.0e9); // ~418.6
+/// Physical sanity band (GHz) for a derived run clock: a consensus outside it means
+/// the FILE is malformed (column order, unit corruption) and there is NO clock —
+/// conversions are refused, never defaulted. Deliberately wide: it gates data
+/// integrity, not operating points. There is NO compiled clock constant in this
+/// module: the SM clock is an operator-mutable operating point, and a stamp here
+/// silently mis-converted every run after the 1455->1905 lock change (the plan/0143
+/// phantom decode regression; call/0038). The clock is DERIVED per run.
+pub const CLOCK_SANITY_GHZ: (f64, f64) = (0.4, 3.5);
+
+/// The run's SM clock in GHz: the MEDIAN of per-record derived clocks
+/// (`cycles / span_ns`) over records with both counters live. A derived property of
+/// the data, never a compiled stamp (call/0038): the ensemble is external to any
+/// single record, so one corrupt record cannot re-scale conversions around itself.
+/// `None` when no record is derivable OR the consensus falls outside
+/// [`CLOCK_SANITY_GHZ`] — then there is NO clock and every cycle<->ns conversion is
+/// refused, not defaulted.
+pub fn run_clock_ghz(recs: &[TeleRecord]) -> Option<f64> {
+    let mut cs: Vec<f64> = recs.iter().filter_map(|r| r.derived_clock_ghz()).collect();
+    if cs.is_empty() {
+        return None;
+    }
+    cs.sort_by(|a, b| a.partial_cmp(b).unwrap()); // finite by construction (both > 0)
+    let c = cs[cs.len() / 2];
+    if c < CLOCK_SANITY_GHZ.0 || c > CLOCK_SANITY_GHZ.1 {
+        return None;
+    }
+    Some(c)
+}
+
+/// Everything a unit conversion needs, bound PER RUN by the caller: the derived run
+/// clock and the declared target's die-fact DRAM peak. Law code in this module takes
+/// this as a parameter and compiles in no target facts; only the CLI binds a target
+/// (the `TU102_*` tables below) plus the run clock it derived from the records.
+#[derive(Clone, Copy, Debug)]
+pub struct TeleCtx {
+    pub run_clock_ghz: f64,
+    pub peak_dram_gbps: f64,
+}
+
+impl TeleCtx {
+    /// Derive the run context from the records themselves; `None` propagates
+    /// [`run_clock_ghz`]'s refusal (no clock, no conversions).
+    pub fn derive(recs: &[TeleRecord], peak_dram_gbps: f64) -> Option<TeleCtx> {
+        run_clock_ghz(recs).map(|c| TeleCtx { run_clock_ghz: c, peak_dram_gbps })
+    }
+}
+
+/// Declared-target die fact (dual-TU102, per GPU): peak DRAM bandwidth in GB/s.
+/// Provenance: TU102 spec bandwidth; consistent with the out-of-band `nvidia-smi
+/// dmon` mem-controller-77%-busy observation (plan/0143 capture). A die fact, not an
+/// operating point — bound by the CLI, never read by the law code above.
+pub const TU102_PEAK_DRAM_GBPS: f64 = 609.0;
 
 /// GPU-global peak HMMA (tensor-pipe) rate in ops/cycle: the projection side's
 /// [`crate::nvidia::projection::TENSOR_HMMA_PER_SM_CLK`] (PAPER.md tab:tensor,
 /// m16n8k8) × 72 SMs (`nvidia::ptxas::TU102_SMS`) — ONE shared per-SM constant, so
 /// the census projection and this measured-column denominator cannot disagree. The
 /// Pipe-column denominator for a tensor op's SCHEDULE-KNOWN whole-op HMMA count,
-/// matching the GPU-global convention `PEAK_DRAM_BYTES_PER_CYCLE` uses.
+/// GPU-global like the DRAM peak above. Die facts, CLI-bound (call/0038).
 pub const TU102_HMMA_PER_CYCLE: f64 =
     crate::nvidia::projection::TENSOR_HMMA_PER_SM_CLK * 72.0; // = 36.0
 /// GPU-global peak fma-pipe rate in ops/cycle: `2.0 op/SM/clk` (PAPER.md tab:alu — FFMA
@@ -96,10 +137,11 @@ impl TeleRecord {
         }
         self.bytes as f64 / ns as f64
     }
-    /// T1 roofline sanity: a record implying a DRAM rate above the wall is an instrument
-    /// error, not an anchor. `false` ⇒ reject the record (do not build an anchor from it).
-    pub fn roofline_ok(&self) -> bool {
-        self.achieved_gbps() <= PEAK_DRAM_BYTES_PER_CYCLE * STAMPED_CLOCK_GHZ // == 609 GB/s
+    /// T1 roofline sanity vs the declared target's die-fact peak: a record implying a
+    /// DRAM rate above the part is an instrument error, not an anchor. `false` ⇒ reject
+    /// the record (do not build an anchor from it). Clock-free: both sides are ns-domain.
+    pub fn roofline_ok(&self, peak_dram_gbps: f64) -> bool {
+        self.achieved_gbps() <= peak_dram_gbps
     }
     /// The record's own realized clock in GHz: `cycles / span_ns`. Both counters are
     /// block-0's (`clock64` and `%globaltimer`), so they are commensurate by
@@ -112,27 +154,30 @@ impl TeleRecord {
         }
         Some(self.cycles as f64 / ns as f64)
     }
-    /// Clock plausibility against the stamp: a derivable clock must sit within
-    /// `tol_frac` of [`STAMPED_CLOCK_GHZ`] (DVFS boost or throttle otherwise corrupts
-    /// every conversion silently); an underivable clock is not checkable (`true`).
-    pub fn clock_plausible(&self, tol_frac: f64) -> bool {
+    /// Clock plausibility against the RUN CONSENSUS (never a compiled stamp,
+    /// call/0038): a derivable clock must sit within `tol_frac` of `run_ghz` (a DVFS
+    /// excursion or corrupt counter otherwise corrupts conversions silently); an
+    /// underivable clock is not checkable (`true`).
+    pub fn clock_plausible(&self, tol_frac: f64, run_ghz: f64) -> bool {
         match self.derived_clock_ghz() {
             None => true,
-            Some(c) => (c - STAMPED_CLOCK_GHZ).abs() <= tol_frac * STAMPED_CLOCK_GHZ,
+            Some(c) => (c - run_ghz).abs() <= tol_frac * run_ghz,
         }
     }
-    /// The clock this record's conversions should use: derived when plausible, else
-    /// the stamp. The fallback keeps an implausible record on the stamped
-    /// denominators — a broken instrument must not re-scale the model around itself.
-    pub fn effective_clock_ghz(&self) -> f64 {
+    /// The clock this record's conversions should use: derived when plausible against
+    /// the run consensus, else the consensus. The fallback keeps an implausible record
+    /// on the RUN's denominators — a broken record must not re-scale the model around
+    /// itself, and a compiled stamp must not overrule the run (call/0038).
+    pub fn effective_clock_ghz(&self, ctx: &TeleCtx) -> f64 {
         match self.derived_clock_ghz() {
-            Some(c) if self.clock_plausible(CLOCK_TOL_FRAC) => c,
-            _ => STAMPED_CLOCK_GHZ,
+            Some(c) if self.clock_plausible(CLOCK_TOL_FRAC, ctx.run_clock_ghz) => c,
+            _ => ctx.run_clock_ghz,
         }
     }
-    /// The per-record DRAM bytes-per-cycle denominator at the effective clock.
-    pub fn dram_bytes_per_cycle(&self) -> f64 {
-        609.0e9 / (self.effective_clock_ghz() * 1.0e9)
+    /// The per-record DRAM bytes-per-cycle denominator at the effective clock
+    /// (GB/s ÷ GHz = bytes/cycle).
+    pub fn dram_bytes_per_cycle(&self, ctx: &TeleCtx) -> f64 {
+        ctx.peak_dram_gbps / self.effective_clock_ghz(ctx)
     }
 }
 
@@ -141,10 +186,10 @@ impl TeleRecord {
 /// OBSERVED wall `cycles` — the wall is the independent realized bound, not the argmax of
 /// the computed columns (those classify; the wall adjudicates). Absent (zero) columns are
 /// omitted. `peak_pipe_rate` is ops/cycle for the op's compute pipe (0 ⇒ no `Pipe` column).
-pub fn measured_steady_state(r: &TeleRecord, peak_pipe_rate: f64) -> SteadyState {
+pub fn measured_steady_state(r: &TeleRecord, peak_pipe_rate: f64, ctx: &TeleCtx) -> SteadyState {
     let mut v: Vec<(ResourceKind, f64)> = Vec::new();
     if r.bytes > 0 {
-        v.push((ResourceKind::MemoryBw, r.bytes as f64 / r.dram_bytes_per_cycle()));
+        v.push((ResourceKind::MemoryBw, r.bytes as f64 / r.dram_bytes_per_cycle(ctx)));
     }
     if r.ops > 0 && peak_pipe_rate > 0.0 {
         v.push((ResourceKind::Pipe(0), r.ops as f64 / peak_pipe_rate));
@@ -158,10 +203,10 @@ pub fn measured_steady_state(r: &TeleRecord, peak_pipe_rate: f64) -> SteadyState
 /// explains the wall; `Latency` when the wall exceeds every throughput column by more than
 /// `tol` (recurrence exposed — `D*L` dominates). The wall adjudicates; the computed
 /// columns classify. `Memory` wins ties (the roofline is the floor we design against).
-pub fn measured_bottleneck(r: &TeleRecord, peak_pipe_rate: f64, tol: f64) -> Bottleneck {
+pub fn measured_bottleneck(r: &TeleRecord, peak_pipe_rate: f64, tol: f64, ctx: &TeleCtx) -> Bottleneck {
     let wall = r.cycles as f64;
     let mem = if r.bytes > 0 {
-        r.bytes as f64 / r.dram_bytes_per_cycle()
+        r.bytes as f64 / r.dram_bytes_per_cycle(ctx)
     } else {
         0.0
     };
@@ -234,9 +279,10 @@ pub fn gate_op(
     peak_pipe_rate: f64,
     tol_cyc: f64,
     tol_cls: f64,
+    ctx: &TeleCtx,
 ) -> Verdict {
     let bound_ok = (projected.ppm_cycles - r.cycles as f64).abs() <= tol_cyc;
-    let class_ok = proj_bottleneck == measured_bottleneck(r, peak_pipe_rate, tol_cls);
+    let class_ok = proj_bottleneck == measured_bottleneck(r, peak_pipe_rate, tol_cls, ctx);
     if bound_ok && class_ok {
         Verdict::Certified
     } else if bound_ok {
@@ -317,6 +363,10 @@ mod tests {
         }
     }
 
+    fn ctx(run_ghz: f64) -> TeleCtx {
+        TeleCtx { run_clock_ghz: run_ghz, peak_dram_gbps: TU102_PEAK_DRAM_GBPS }
+    }
+
     // T2 span well-formedness: span >= 0 (saturating), overlap in [0,1], 0 disjoint.
     #[test]
     fn t2_span_and_overlap_wellformed() {
@@ -334,44 +384,48 @@ mod tests {
     // T1 roofline sanity: a record implying > 609 GB/s is rejected.
     #[test]
     fn t1_roofline_rejects_superluminal() {
-        assert!(rec(0, 100, 0, 1_000, 0).roofline_ok()); // 10 GB/s, fine
-        assert!(!rec(0, 1, 0, 100_000, 0).roofline_ok()); // 100000 GB/s, impossible
+        assert!(rec(0, 100, 0, 1_000, 0).roofline_ok(TU102_PEAK_DRAM_GBPS)); // 10 GB/s, fine
+        assert!(!rec(0, 1, 0, 100_000, 0).roofline_ok(TU102_PEAK_DRAM_GBPS)); // 100000 GB/s, impossible
     }
 
     // T3 bound faithfulness: measured ppm == the observed wall; columns == bytes/rate.
     #[test]
     fn t3_reconstruct_is_exact() {
         let r = rec(0, 1000, 4242, 41_860, 84); // arbitrary bytes/ops
-        let ss = measured_steady_state(&r, 2.0);
+        // record's own derived 4.242 GHz is implausible vs the 1.455 run consensus,
+        // so conversions run at the consensus.
+        let c = ctx(1.455);
+        let ss = measured_steady_state(&r, 2.0, &c);
         assert_eq!(ss.ppm_cycles, 4242.0); // wall, not the argmax column (no fudge)
         let mem = ss.per_resource.iter().find(|(k, _)| *k == ResourceKind::MemoryBw).unwrap().1;
         let pipe = ss.per_resource.iter().find(|(k, _)| *k == ResourceKind::Pipe(0)).unwrap().1;
         // faithfulness: each column is EXACTLY numerator/rate, no fudge factor.
-        assert_eq!(mem, 41_860.0 / PEAK_DRAM_BYTES_PER_CYCLE);
+        assert_eq!(mem, 41_860.0 / (TU102_PEAK_DRAM_GBPS / 1.455));
         assert_eq!(pipe, 84.0 / 2.0);
     }
 
     // T5 classification gate: right-number-wrong-column is Provisional, never Certified.
     #[test]
     fn t5_classification_gate() {
-        // memory-bound op: bytes big, wall == the memory demand.
+        // memory-bound op: bytes big, wall == the memory demand (at a 1.455 consensus).
         let r = rec(0, 1000, 100, 41_860, 0); // mem demand 100 cyc == wall
-        let ss = measured_steady_state(&r, 0.0);
+        let c = ctx(1.455);
+        let ss = measured_steady_state(&r, 0.0, &c);
         // projection that agrees on BOUND and COLUMN -> Certified.
         assert_eq!(
-            gate_op(&ss, Bottleneck::Memory, &r, 0.0, 5.0, 5.0),
+            gate_op(&ss, Bottleneck::Memory, &r, 0.0, 5.0, 5.0, &c),
             Verdict::Certified
         );
         // right bound, WRONG column (says Pipe) -> Provisional.
         assert_eq!(
-            gate_op(&ss, Bottleneck::Pipe(0), &r, 0.0, 5.0, 5.0),
+            gate_op(&ss, Bottleneck::Pipe(0), &r, 0.0, 5.0, 5.0, &c),
             Verdict::Provisional
         );
         // wrong bound -> Refused.
         let mut ss2 = ss.clone();
         ss2.ppm_cycles = 500.0;
         assert_eq!(
-            gate_op(&ss2, Bottleneck::Memory, &r, 0.0, 5.0, 5.0),
+            gate_op(&ss2, Bottleneck::Memory, &r, 0.0, 5.0, 5.0, &c),
             Verdict::Refused
         );
     }
@@ -381,7 +435,7 @@ mod tests {
     fn measured_bottleneck_latency_when_wall_exceeds_throughput() {
         // small bytes/ops (tiny throughput demand) but a big wall -> recurrence exposed.
         let r = rec(0, 10, 1000, 418, 0); // mem demand ~1 cyc, wall 1000
-        assert_eq!(measured_bottleneck(&r, 0.0, 5.0), Bottleneck::Latency);
+        assert_eq!(measured_bottleneck(&r, 0.0, 5.0, &ctx(1.455)), Bottleneck::Latency);
     }
 
     #[test]
@@ -420,49 +474,59 @@ mod tests {
     fn true_op_wall_clears_block_uneven_false_reject() {
         // 100 kB whole-op over block-0's 100 ns span => 1000 GB/s > 609 => FALSE reject.
         let block0 = rec(0, 100, 0, 100_000, 0);
-        assert!(!block0.roofline_ok());
+        assert!(!block0.roofline_ok(TU102_PEAK_DRAM_GBPS));
         assert_eq!(block0.wall_ns(), 100);
         // The op's true wall (slowest block) is 200 ns => 500 GB/s <= 609 => accepted.
         let mut whole = block0.clone();
         whole.op_wall_ns = 200;
         assert_eq!(whole.wall_ns(), 200);
-        assert!(whole.roofline_ok());
+        assert!(whole.roofline_ok(TU102_PEAK_DRAM_GBPS));
         // Monotone/robust: a mis-attached wall SHORTER than block-0's span never raises the
         // rate (max keeps wall_ns >= span_ns), so it cannot manufacture a false accept.
         let mut bad = block0.clone();
         bad.op_wall_ns = 50; // < span 100
         assert_eq!(bad.wall_ns(), 100); // clamped up to the span
-        assert!(!bad.roofline_ok());
+        assert!(!bad.roofline_ok(TU102_PEAK_DRAM_GBPS));
     }
 
-    // clock derivation: derived when both counters present, plausibility-gated
-    // against the stamp, stamped-clock fallback for implausible/underivable records.
+    // The clock is a DERIVED RUN PROPERTY (call/0038): consensus = median of derived
+    // clocks; a shifted record is flagged against the consensus and converts at it;
+    // no compiled stamp exists to overrule the run.
     #[test]
-    fn clock_derives_and_gates_plausibility() {
-        // 1500 cycles over 1000 ns = 1.500 GHz: ~3% off the stamp -> plausible, used.
-        let boost = rec(0, 1000, 1500, 0, 0);
-        assert!((boost.derived_clock_ghz().unwrap() - 1.5).abs() < 1e-12);
-        assert!(boost.clock_plausible(CLOCK_TOL_FRAC));
-        assert!((boost.effective_clock_ghz() - 1.5).abs() < 1e-12);
-        // 4242 cycles over 1000 ns = 4.242 GHz: a shifted-clock record is FLAGGED
-        // (implausible) and falls back to the stamped denominators.
-        let shifted = rec(0, 1000, 4242, 0, 0);
-        assert!(!shifted.clock_plausible(CLOCK_TOL_FRAC));
-        assert_eq!(shifted.effective_clock_ghz(), STAMPED_CLOCK_GHZ);
-        // underivable (no cycles or no span): not checkable, stamped fallback.
+    fn clock_is_derived_consensus_not_a_stamp() {
+        let runs = vec![
+            rec(0, 1000, 1900, 0, 0),
+            rec(0, 1000, 1905, 0, 0),
+            rec(0, 1000, 1905, 0, 0),
+            rec(0, 1000, 1910, 0, 0),
+            rec(0, 1000, 4242, 0, 0), // one corrupt record: inert under the median
+        ];
+        let run = run_clock_ghz(&runs).unwrap();
+        assert!((run - 1.905).abs() < 1e-12);
+        let c = ctx(run);
+        assert!(runs[0].clock_plausible(CLOCK_TOL_FRAC, run));
+        assert!((runs[0].effective_clock_ghz(&c) - 1.9).abs() < 1e-12); // derived, used
+        // the corrupt record is FLAGGED vs the consensus and converts at it.
+        assert!(!runs[4].clock_plausible(CLOCK_TOL_FRAC, run));
+        assert_eq!(runs[4].effective_clock_ghz(&c), run);
+        // underivable (no cycles or no span): not checkable, consensus fallback.
         let absent = rec(0, 0, 0, 0, 0);
         assert_eq!(absent.derived_clock_ghz(), None);
-        assert!(absent.clock_plausible(CLOCK_TOL_FRAC));
-        assert_eq!(absent.effective_clock_ghz(), STAMPED_CLOCK_GHZ);
+        assert!(absent.clock_plausible(CLOCK_TOL_FRAC, run));
+        assert_eq!(absent.effective_clock_ghz(&c), run);
+        // a file with no derivable record, or an insane consensus, has NO clock:
+        // conversions are refused, never defaulted.
+        assert_eq!(run_clock_ghz(&[absent]), None);
+        assert_eq!(run_clock_ghz(&[rec(0, 1000, 42_000, 0, 0)]), None); // 42 GHz: malformed
     }
 
     #[test]
     fn clock_rescales_memory_demand_when_plausible() {
-        // At a plausible 1.5 GHz boost the same bytes cost MORE cycles of demand
-        // (fewer bytes move per cycle), and the roofline reference stays 609 GB/s.
+        // At a plausible 1.5 GHz run the same bytes cost MORE cycles of demand than at
+        // 1.455 (fewer bytes move per cycle), and the roofline reference stays 609 GB/s.
         let r = rec(0, 1000, 1500, 418_600, 0);
         let expected = 418_600.0 / (609.0e9 / 1.5e9);
-        let ss = measured_steady_state(&r, 0.0);
+        let ss = measured_steady_state(&r, 0.0, &ctx(1.5));
         let mem = ss.per_resource.iter().find(|(k, _)| *k == ResourceKind::MemoryBw).unwrap().1;
         assert!((mem - expected).abs() < 1e-9);
     }
@@ -505,7 +569,8 @@ mod tests {
             op_wall_ns: 0,
         };
         let rate = op_pipe_rate(&r.kind);
-        let ss = measured_steady_state(&r, rate);
+        let c = ctx(1.455);
+        let ss = measured_steady_state(&r, rate, &c);
         // the Pipe column is present (populated from ops / rate) and equals 3600/36 = 100.
         let pipe = ss
             .per_resource
@@ -514,7 +579,7 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(pipe, 100.0);
-        assert_eq!(measured_bottleneck(&r, rate, 5.0), Bottleneck::Pipe(0));
+        assert_eq!(measured_bottleneck(&r, rate, 5.0, &c), Bottleneck::Pipe(0));
     }
 }
 

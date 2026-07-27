@@ -19,8 +19,8 @@ use calx_mill::validity::{
     Anchor, AnchorRow, Authority, DomainFit, Verdict, USAGE_EXIT,
 };
 use calx_mill::telemetry::{
-    measured_bottleneck, op_pipe_rate, overlap_fraction, parse_tele_counted, TeleRecord,
-    CLOCK_TOL_FRAC,
+    measured_bottleneck, op_pipe_rate, overlap_fraction, parse_tele_counted, TeleCtx,
+    TeleRecord, CLOCK_TOL_FRAC, TU102_PEAK_DRAM_GBPS,
 };
 use std::path::Path;
 use std::process::ExitCode;
@@ -834,25 +834,44 @@ fn run() -> Result<i32, String> {
             if recs.is_empty() {
                 return Err(format!("{}: no telemetry records parsed", path));
             }
-            let n_bad: usize = recs.iter().filter(|r| !r.roofline_ok()).count();
+            // The run clock is DERIVED from the records (median of the dual-counter
+            // ratios; call/0038) — no compiled stamp. A file with no derivable clock
+            // gets NO cycle<->ns conversions, refused rather than defaulted.
+            let ctx = match TeleCtx::derive(&recs, TU102_PEAK_DRAM_GBPS) {
+                Some(c) => c,
+                None => {
+                    return Err(format!(
+                        "{}: no derivable run clock (no record with both counters live, \
+                         or a consensus outside the physical sanity band) -- cycle<->ns \
+                         conversions refused, not defaulted (call/0038)",
+                        path
+                    ))
+                }
+            };
+            let n_bad: usize = recs
+                .iter()
+                .filter(|r| !r.roofline_ok(TU102_PEAK_DRAM_GBPS))
+                .count();
             let n_clock: usize = recs
                 .iter()
-                .filter(|r| !r.clock_plausible(CLOCK_TOL_FRAC))
+                .filter(|r| !r.clock_plausible(CLOCK_TOL_FRAC, ctx.run_clock_ghz))
                 .count();
             let n_bytes: usize = recs.iter().filter(|r| r.bytes > 0).count();
             let sum_cyc: u64 = recs.iter().map(|r| r.cycles).sum();
-            // ms from each record's own effective clock (derived-else-stamped), so a
-            // plausible DVFS excursion converts honestly instead of at the stamp.
+            // ms from each record's effective clock (derived when plausible against the
+            // run consensus, else the consensus), so a DVFS excursion converts honestly.
             let sum_ms: f64 = recs
                 .iter()
-                .map(|r| r.cycles as f64 / (r.effective_clock_ghz() * 1.0e9) * 1e3)
+                .map(|r| r.cycles as f64 / (r.effective_clock_ghz(&ctx) * 1.0e9) * 1e3)
                 .sum();
             let sum_span: u64 = recs.iter().map(|r| r.span_ns()).sum();
             println!(
-                "telemetry: {} op records; Σcycles {} ({:.3} ms, per-record derived-else-stamped \
-                 clock); Σgt-span {:.3} ms; {} with bytes; {} roofline-violating (T1 reject); \
-                 {} clock-implausible (stamped fallback, no anchor)",
+                "telemetry: {} op records; run clock {:.3} GHz (derived consensus); \
+                 Σcycles {} ({:.3} ms at per-record effective clocks); Σgt-span {:.3} ms; \
+                 {} with bytes; {} roofline-violating (T1 reject); \
+                 {} clock-implausible (consensus fallback, no anchor)",
                 recs.len(),
+                ctx.run_clock_ghz,
                 sum_cyc,
                 sum_ms,
                 sum_span as f64 / 1e6,
@@ -874,7 +893,7 @@ fn run() -> Result<i32, String> {
                 let bind = if r.bytes == 0 && (r.ops == 0 || rate == 0.0) {
                     "-".to_string() // no bytes/ops columns yet -> unclassified
                 } else {
-                    match measured_bottleneck(r, rate, 0.0) {
+                    match measured_bottleneck(r, rate, 0.0, &ctx) {
                         Bottleneck::Memory => "mem".to_string(),
                         Bottleneck::Pipe(_) => "pipe".to_string(),
                         Bottleneck::Latency => "lat".to_string(),

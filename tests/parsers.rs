@@ -17,9 +17,12 @@ fn write_scratch(name: &str, content: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
+// The intact row derives a physical 1.9 GHz clock (190 cycles / 100 ns): the run
+// clock is a derived property (call/0038) and an unphysical fixture would be
+// refused wholesale before the parser-loss counting this test pins.
 const TRUNCATED_TELE: &str = "\
 op_index\top_kind\tlane\tgt_start_ns\tgt_end_ns\tcycles\tbytes\tops
-6\tMMVQ_Q4_0\tmem\t100\t200\t75282\t0\t0
+6\tMMVQ_Q4_0\tmem\t100\t200\t190\t0\t0
 7\tGEMV_F16\tmem\t100\t200
 ";
 

@@ -429,8 +429,11 @@ pub fn mk_table(
                     &deviation,
                     &flag,
                     &measured_by,
-                    // the stamped clock (telemetry::STAMPED_CLOCK_GHZ) as an integer
-                    // MHz string; kept literal for the byte-for-byte golden
+                    // the SM-clock domain of the 1455-era measurement corpus this
+                    // golden reproduces byte-for-byte (mk_table.py parity): a data
+                    // fact of those runs, not a conversion constant. A new corpus
+                    // supplies its own clock as an input (call/0038; the registry
+                    // environment-axis work makes it a checked field).
                     "1455",
                     &all_notes,
                 ],
