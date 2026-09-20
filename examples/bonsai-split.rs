@@ -52,9 +52,10 @@ fn vram_weights_budget(n_gpu_linear: usize, n_gpu_full: usize) -> f64 {
 const VEC_DOT_UOPS_PER_BLOCK: f64 = 90.0;
 // PQ2_0 AVX2 branch: shift+and extract + maddubs + madd: ~18 uops per 34-byte block.
 const PQ2_VEC_DOT_UOPS_PER_BLOCK: f64 = 18.0;
-// Repack path: decode paid once at load; steady-state dot is ~8 uops per block
-// against Q8_0 and the loop is issue-comfortable, so the leg is memory-bound.
-const REPACK_UOPS_PER_BLOCK: f64 = 8.0;
+// Repack path: decode paid once at load into 2-bit slots; the steady-state
+// gemv expands each 8-byte code row to a ymm (dword spread) and dots with
+// maddubs/madd: about 60 uops per block per row at the landed kernel's mix.
+const REPACK_UOPS_PER_BLOCK: f64 = 60.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kernel {
@@ -73,7 +74,7 @@ struct Cpu {
     cores: f64,
     clock_ghz: f64,
     dram_gbps: f64, // theoretical peak
-    dram_eff: f64,  // STREAM-class achieved fraction
+    dram_eff: f64, // STREAM-class achieved fraction
     // uop multiplier for the SIMD ladder this core runs: 1.0 where 256-bit
     // integer ops are native (AVX2), 1.5 where they crack to 2x128 (Zen 1),
     // 2.0 for the AVX-only ladder (Sandy/Ivy Bridge: 128-bit integer + 256-bit
@@ -178,24 +179,55 @@ fn cpus() -> Vec<Cpu> {
     ]
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Packing {
+    // 28 B per 128 weights; TG128 anchor on the local RTX 6000 (2026-09-20):
+    // 31.84 tok/s = 5.66 GB / 31.5 ms = 180 GB/s decode-effective (0.30 of
+    // the 609 GB/s measured DRAM): Turing decode is instruction-bound.
+    Ptq10,
+    // 34 B per 128 weights; same rig: 41.90 tok/s = 268 GB/s (0.44). The
+    // cheaper unpacking wins both phases on Turing; the trade is 21 percent
+    // more bytes per layer.
+    Pq20,
+}
+
+impl Packing {
+    fn linear_layer(self) -> f64 {
+        match self { Packing::Ptq10 => 84.91e6, Packing::Pq20 => 84.91e6 * 34.0 / 28.0 }
+    }
+    fn full_layer(self) -> f64 {
+        match self { Packing::Ptq10 => 81.47e6, Packing::Pq20 => 81.47e6 * 34.0 / 28.0 }
+    }
+    fn output(self) -> f64 {
+        match self { Packing::Ptq10 => 278.1e6, Packing::Pq20 => 278.1e6 * 34.0 / 28.0 }
+    }
+    fn blocks_per_byte(self) -> f64 {
+        match self { Packing::Ptq10 => 1.0 / 28.0, Packing::Pq20 => 1.0 / 34.0 }
+    }
+}
+
 struct Gpu {
     name: &'static str,
     sms: f64,
     dram_gbps: f64,
     dram_eff: f64,
+    ptq10_decode_gbps: f64,
+    pq20_decode_gbps: f64,
     // Batch-1 TG decode-effective GB/s for PTQ1_0: Turing's MMVQ path is
     // instruction/launch-bound, not bandwidth-bound. Anchor: the local RTX
     // 6000 measures 31.84 tok/s at full offload (llama-bench, 2026-09-20) =
     // 5.66 GB / 31.5 ms = 180 GB/s against 609 GB/s measured DRAM (0.30).
     // The 16-SM TU117 scales the instruction side by SM count.
     // Per-SM axes remain tu102_sm() verbatim for every Turing part here.
-    decode_gbps: f64,
 }
 
 fn gpus() -> Vec<Gpu> {
+    let sm_scale = 16.0 / 72.0;
     vec![
-        Gpu { name: "TU117-4GiB (T1000/GTX1650 class)", sms: 16.0, dram_gbps: 160.0, dram_eff: 0.85, decode_gbps: (16.0 / 72.0) * 180.0 },
-        Gpu { name: "RTX 6000 (TU102, local anchor)", sms: 72.0, dram_gbps: 672.0, dram_eff: 0.907, decode_gbps: 180.0 }, // measured (see above); 609 measured / 672 peak DRAM, calx-mill fixture
+        Gpu { name: "TU117-4GiB (T1000/GTX1650 class)", sms: 16.0, dram_gbps: 160.0, dram_eff: 0.85,
+              ptq10_decode_gbps: sm_scale * 180.0, pq20_decode_gbps: sm_scale * 268.0 },
+        Gpu { name: "RTX 6000 (TU102, local anchor)", sms: 72.0, dram_gbps: 672.0, dram_eff: 0.907,
+              ptq10_decode_gbps: 180.0, pq20_decode_gbps: 268.0 }, // both measured 2026-09-20
     ]
 }
 
@@ -218,11 +250,12 @@ struct Leg {
 /// (decode + dot uops across all cores), named by the PPM bound. Every demand
 /// is pre-scaled to nanoseconds: the Issue axis enters as machine uops/ns
 /// (cores x issue_cap x clock), so total_ops / issue_cap is already ns.
-fn cpu_leg(cpu: &Cpu, bytes: f64, kernel: Kernel) -> Leg {
-    let blocks = bytes / 28.0; // PTQ1_0: one 128-weight block per 28 B
-    let uops_per_block = match kernel {
-        Kernel::VecDot => VEC_DOT_UOPS_PER_BLOCK,
-        Kernel::Repacked => REPACK_UOPS_PER_BLOCK,
+fn cpu_leg(cpu: &Cpu, bytes: f64, kernel: Kernel, packing: Packing) -> Leg {
+    let blocks = bytes * packing.blocks_per_byte();
+    let uops_per_block = match (kernel, packing) {
+        (Kernel::VecDot, Packing::Ptq10) => VEC_DOT_UOPS_PER_BLOCK,
+        (Kernel::VecDot, Packing::Pq20) => PQ2_VEC_DOT_UOPS_PER_BLOCK,
+        (Kernel::Repacked, _) => REPACK_UOPS_PER_BLOCK,
     } * cpu.uops_scale;
     let total_ops = blocks * uops_per_block;
     let uops_per_ns = cpu.cores * cpu.substrate.issue_cap as f64 * cpu.clock_ghz;
@@ -240,9 +273,12 @@ fn cpu_leg(cpu: &Cpu, bytes: f64, kernel: Kernel) -> Leg {
     Leg { ns: ss.ppm_cycles, bound: format!("{:?}", ss.per_resource[ss.ppm_bound].0) }
 }
 
-fn gpu_leg(gpu: &Gpu, bytes: f64) -> Leg {
-    let ns = bytes / gpu.decode_gbps;
-    Leg { ns, bound: "MemoryBw".into() }
+fn gpu_leg(gpu: &Gpu, bytes: f64, packing: Packing) -> Leg {
+    let rate = match packing {
+        Packing::Ptq10 => gpu.ptq10_decode_gbps,
+        Packing::Pq20 => gpu.pq20_decode_gbps,
+    };
+    Leg { ns: bytes / rate, bound: "MemoryBw".into() }
 }
 
 fn pcie_leg(bytes: f64) -> f64 {
@@ -250,7 +286,7 @@ fn pcie_leg(bytes: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------- sweep
-fn layer_bytes(n_gpu: usize) -> (f64, f64, usize, usize) {
+fn layer_bytes(n_gpu: usize, packing: Packing) -> (f64, f64, usize, usize) {
     // llama.cpp offloads layers 0..n_gpu-1; classes interleave as 3,7,.. full.
     let mut g = 0.0;
     let mut c = 0.0;
@@ -258,7 +294,7 @@ fn layer_bytes(n_gpu: usize) -> (f64, f64, usize, usize) {
     let mut gf = 0usize;
     for i in 0..N_LAYERS {
         let is_full = i % 4 == 3;
-        let b = if is_full { BYTES_FULL_ATTN_LAYER } else { BYTES_LINEAR_LAYER };
+        let b = if is_full { packing.full_layer() } else { packing.linear_layer() };
         if i < n_gpu {
             g += b;
             if is_full { gf += 1 } else { gl += 1 }
@@ -269,16 +305,16 @@ fn layer_bytes(n_gpu: usize) -> (f64, f64, usize, usize) {
     (g, c, gl, gf)
 }
 
-fn sweep(cpu: &Cpu, gpu: &Gpu, kernel: Kernel, fixed_ns: f64, output_on_gpu: bool) -> Vec<(usize, f64, f64, String)> {
+fn sweep(cpu: &Cpu, gpu: &Gpu, kernel: Kernel, packing: Packing, fixed_ns: f64) -> Vec<(usize, f64, f64, String)> {
     let mut rows = Vec::new();
     for n_gpu in 0..=N_LAYERS {
-        let (mut gbytes, mut cbytes, gl, gf) = layer_bytes(n_gpu);
+        let (mut gbytes, mut cbytes, gl, gf) = layer_bytes(n_gpu, packing);
         // the output head streams wherever it lives; llama.cpp keeps it with
-        // the CPU unless the whole model is offloaded (both variants printed)
-        if output_on_gpu || n_gpu == N_LAYERS {
-            gbytes += BYTES_OUTPUT_HEAD;
+        // the CPU unless the whole model is offloaded
+        if n_gpu == N_LAYERS {
+            gbytes += packing.output();
         } else {
-            cbytes += BYTES_OUTPUT_HEAD;
+            cbytes += packing.output();
         }
         cbytes += BYTES_EMBD_ROW;
         // VRAM feasibility at the 4 GiB budget (only binding for the small card)
@@ -286,8 +322,8 @@ fn sweep(cpu: &Cpu, gpu: &Gpu, kernel: Kernel, fixed_ns: f64, output_on_gpu: boo
         if gpu.sms < 30.0 && gbytes > budget {
             continue; // infeasible split for a 4 GiB card
         }
-        let g = gpu_leg(gpu, gbytes);
-        let c = cpu_leg(cpu, cbytes, kernel);
+        let g = gpu_leg(gpu, gbytes, packing);
+        let c = cpu_leg(cpu, cbytes, kernel, packing);
         let pcie = pcie_leg(D_MODEL * 4.0 * 2.0); // activation crossing, both ways
         let t = g.ns + c.ns + pcie + (n_gpu as f64 + (N_LAYERS - n_gpu) as f64) * fixed_ns;
         rows.push((n_gpu, 1e9 / t, t / 1e6, format!("{}|{}", g.bound, c.bound)));
@@ -297,36 +333,41 @@ fn sweep(cpu: &Cpu, gpu: &Gpu, kernel: Kernel, fixed_ns: f64, output_on_gpu: boo
 
 fn main() {
     let full = std::env::args().any(|a| a == "--full");
-    let fixed = per_layer_fixed_ns(40_000.0); // placeholder until the anchor lands; see plan/0001
-    println!("Ternary-Bonsai-2-27B PTQ1_0 layer-split sweep (context {:.0}, PCIe Gen3 x16)", CTX_TOKENS);
-    println!("model: {} layers ({} full-attn x {:.2} MB, {} linear x {:.2} MB), output head {:.0} MB\n",
-        N_LAYERS, FULL_ATTN_LAYERS, BYTES_FULL_ATTN_LAYER / 1e6, LINEAR_LAYERS, BYTES_LINEAR_LAYER / 1e6, BYTES_OUTPUT_HEAD / 1e6);
+    let fixed = per_layer_fixed_ns(40_000.0);
+    println!("Ternary-Bonsai-2-27B layer-split sweep (context {:.0}, PCIe Gen3 x16)", CTX_TOKENS);
+    println!("model: {} layers (16 full-attn / 48 linear; PTQ1_0 {:.2}/{:.2} MB, PQ2_0 {:.2}/{:.2} MB)\n",
+        N_LAYERS,
+        BYTES_FULL_ATTN_LAYER / 1e6, BYTES_LINEAR_LAYER / 1e6,
+        BYTES_FULL_ATTN_LAYER * 34.0 / 28.0 / 1e6, BYTES_LINEAR_LAYER * 34.0 / 28.0 / 1e6);
 
-    println!("== primary target: 4 GiB Turing + i9-10885H ==");
+    println!("== primary target: 4 GiB Turing + i9-10885H, both packings ==");
     let cpu = &cpus()[0];
     let gpu = &gpus()[0];
-    for kernel in [Kernel::VecDot, Kernel::Repacked] {
-        let rows = sweep(cpu, gpu, kernel, fixed, false);
-        if let Some(best) = rows.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
-            println!("{:>9}: best split ngl={:>2}  {:>6.2} tok/s  ({:.2} ms/token, bound {})",
-                if kernel == Kernel::VecDot { "vec_dot" } else { "repacked" }, best.0, best.1, best.2, best.3);
-        } else {
-            println!("{:>9}: no feasible split at the 4 GiB budget", if kernel == Kernel::VecDot { "vec_dot" } else { "repacked" });
-        }
-        if full {
-            for (n, tps, ms, b) in rows.iter().step_by(4) {
-                println!("           ngl={:>2}  {:>6.2} tok/s  {:>6.2} ms  {}", n, tps, ms, b);
+    for packing in [Packing::Ptq10, Packing::Pq20] {
+        for kernel in [Kernel::VecDot, Kernel::Repacked] {
+            let rows = sweep(cpu, gpu, kernel, packing, fixed);
+            let kname = if kernel == Kernel::VecDot { "vec_dot" } else { "repacked" };
+            match rows.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+                Some(best) => println!("{:>6}/{:>9}: best ngl={:>2}  {:>6.2} tok/s  ({:.1} ms/token, bound {})",
+                    if packing == Packing::Ptq10 { "PTQ1_0" } else { "PQ2_0" }, kname, best.0, best.1, best.2, best.3),
+                None => println!("{:>6}/{:>9}: no feasible split at the 4 GiB budget",
+                    if packing == Packing::Ptq10 { "PTQ1_0" } else { "PQ2_0" }, kname),
+            }
+            if full {
+                for (n, tps, ms, b) in rows.iter().step_by(4) {
+                    println!("           ngl={:>2}  {:>6.2} tok/s  {:>6.2} ms  {}", n, tps, ms, b);
+                }
             }
         }
     }
 
-    println!("\n== divergence matrix: best tok/s by CPU class and kernel (4 GiB Turing) ==");
+    println!("\n== divergence matrix: best tok/s by CPU class and kernel (4 GiB Turing, PTQ1_0) ==");
     println!("{:<32} {:>12} {:>12} {:>14}", "CPU", "vec_dot", "repacked", "repack gain");
     for cpu in cpus() {
         let mut line = format!("{:<32}", cpu.name);
         let mut vals = Vec::new();
         for kernel in [Kernel::VecDot, Kernel::Repacked] {
-            let rows = sweep(&cpu, &gpus()[0], kernel, fixed, false);
+            let rows = sweep(&cpu, &gpus()[0], kernel, Packing::Ptq10, fixed);
             let best = rows.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|r| r.1).unwrap_or(0.0);
             vals.push(best);
             line += &format!(" {:>12.2}", best);
@@ -336,16 +377,17 @@ fn main() {
     }
 
     println!("\n== local anchor rig: RTX 6000 + Xeon W-2140B ==");
-    for kernel in [Kernel::VecDot, Kernel::Repacked] {
-        let rows = sweep(&cpus()[6], &gpus()[1], kernel, fixed, false);
+    for packing in [Packing::Ptq10, Packing::Pq20] {
+        let rows = sweep(&cpus()[6], &gpus()[1], Kernel::Repacked, packing, fixed);
         if let Some(best) = rows.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
-            println!("{:>9}: best split ngl={:>2}  {:>6.2} tok/s (bound {})",
-                if kernel == Kernel::VecDot { "vec_dot" } else { "repacked" }, best.0, best.1, best.3);
+            println!("{:>6}: best split ngl={:>2}  {:>6.2} tok/s",
+                if packing == Packing::Ptq10 { "PTQ1_0" } else { "PQ2_0" }, best.0, best.1);
         }
     }
 
-    // the pure-GPU end of the local rig, against the measured anchor
-    // (llama-bench tg128, ngl 99: 31.84 tok/s, 2026-09-20)
-    let all_gpu = gpu_leg(&gpus()[1], layer_bytes(64).0 + BYTES_OUTPUT_HEAD);
-    println!("pure GPU (ngl 64): {:.2} tok/s at the measured decode-effective rate (anchor: 31.84 tok/s)", 1e9 / all_gpu.ns);
+    // the pure-GPU ends, against the measured anchors (llama-bench, 2026-09-20)
+    let a = gpu_leg(&gpus()[1], layer_bytes(64, Packing::Ptq10).0 + Packing::Ptq10.output(), Packing::Ptq10);
+    let b = gpu_leg(&gpus()[1], layer_bytes(64, Packing::Pq20).0 + Packing::Pq20.output(), Packing::Pq20);
+    println!("pure GPU (ngl 64): PTQ1_0 {:.2} tok/s (anchor 31.84), PQ2_0 {:.2} tok/s (anchor 41.90)",
+        1e9 / a.ns, 1e9 / b.ns);
 }
