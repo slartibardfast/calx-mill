@@ -45,9 +45,11 @@ fn vram_weights_budget(n_gpu_linear: usize, n_gpu_full: usize) -> f64 {
 
 // ---------------------------------------------------------------- kernels
 // AVX2 vec_dot for PTQ1_0 (no VNNI): per 128-weight block, the base-3 decode is
-// 5 passes of (vpmullo16, vpand, vpmullo16, vpsrl16) over 4 ymm plus pack/sub,
-// then vpmaddubsw + vpmaddwd accumulation: ~44 uops per 28-byte block.
-const VEC_DOT_UOPS_PER_BLOCK: f64 = 44.0;
+// 5 passes of (vpmullo16, vpand, vpmullo16, vpsrl16) on 16+8 lanes plus the
+// pack/permute staging and the maddubs/madd dot. The landed kernel's
+// instruction mix measures ~115 uops single-block, ~90 marginal with the
+// intended two-block interleave: budget 90 per 28-byte block.
+const VEC_DOT_UOPS_PER_BLOCK: f64 = 90.0;
 // PQ2_0 AVX2 branch: shift+and extract + maddubs + madd: ~18 uops per 34-byte block.
 const PQ2_VEC_DOT_UOPS_PER_BLOCK: f64 = 18.0;
 // Repack path: decode paid once at load; steady-state dot is ~8 uops per block
@@ -181,14 +183,19 @@ struct Gpu {
     sms: f64,
     dram_gbps: f64,
     dram_eff: f64,
-    // per-SM axes are tu102_sm() verbatim for every Turing part modeled here;
-    // decode at batch 1 never approaches the SM pipe limits on any of them.
+    // Batch-1 TG decode-effective GB/s for PTQ1_0: Turing's MMVQ path is
+    // instruction/launch-bound, not bandwidth-bound. Anchor: the local RTX
+    // 6000 measures 31.84 tok/s at full offload (llama-bench, 2026-09-20) =
+    // 5.66 GB / 31.5 ms = 180 GB/s against 609 GB/s measured DRAM (0.30).
+    // The 16-SM TU117 scales the instruction side by SM count.
+    // Per-SM axes remain tu102_sm() verbatim for every Turing part here.
+    decode_gbps: f64,
 }
 
 fn gpus() -> Vec<Gpu> {
     vec![
-        Gpu { name: "TU117-4GiB (T1000/GTX1650 class)", sms: 16.0, dram_gbps: 160.0, dram_eff: 0.85 },
-        Gpu { name: "RTX 6000 (TU102, local anchor)", sms: 72.0, dram_gbps: 672.0, dram_eff: 0.907 }, // 609 measured / 672 peak, calx-mill fixture
+        Gpu { name: "TU117-4GiB (T1000/GTX1650 class)", sms: 16.0, dram_gbps: 160.0, dram_eff: 0.85, decode_gbps: (16.0 / 72.0) * 180.0 },
+        Gpu { name: "RTX 6000 (TU102, local anchor)", sms: 72.0, dram_gbps: 672.0, dram_eff: 0.907, decode_gbps: 180.0 }, // measured (see above); 609 measured / 672 peak DRAM, calx-mill fixture
     ]
 }
 
@@ -234,7 +241,7 @@ fn cpu_leg(cpu: &Cpu, bytes: f64, kernel: Kernel) -> Leg {
 }
 
 fn gpu_leg(gpu: &Gpu, bytes: f64) -> Leg {
-    let ns = bytes / (gpu.dram_gbps * gpu.dram_eff);
+    let ns = bytes / gpu.decode_gbps;
     Leg { ns, bound: "MemoryBw".into() }
 }
 
@@ -337,7 +344,8 @@ fn main() {
         }
     }
 
-    // the pure-GPU end of the local rig, for anchor comparison
+    // the pure-GPU end of the local rig, against the measured anchor
+    // (llama-bench tg128, ngl 99: 31.84 tok/s, 2026-09-20)
     let all_gpu = gpu_leg(&gpus()[1], layer_bytes(64).0 + BYTES_OUTPUT_HEAD);
-    println!("pure GPU (ngl 64): {:.2} tok/s ceiling at measured DRAM", 1e9 / all_gpu.ns);
+    println!("pure GPU (ngl 64): {:.2} tok/s at the measured decode-effective rate (anchor: 31.84 tok/s)", 1e9 / all_gpu.ns);
 }
