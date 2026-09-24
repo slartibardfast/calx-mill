@@ -240,6 +240,19 @@ fn per_layer_fixed_ns(calibrated: f64) -> f64 {
     calibrated
 }
 
+// The LACUNAE-named blind spot, now measured (plan/0008, 2026-09-24): the
+// mixed-split CPU leg is per-op-overhead-bound, not compute-bound. Anchor
+// calibration: ngl 37, repack on, op-offload off, t16, elision-era binary on
+// the local rig measures 4.07 tok/s (245.7 ms/token) against this sweep's
+// compute-bound prediction of ~73 ms at the same split; the ~172 ms gap over
+// 27 CPU-side layers is scheduler splits (~175 per compute, measured with
+// GGML_SCHED_DEBUG), per-op barriers, and the host node walk. Charged as a
+// fixed ns per CPU-side layer. Transfer assumption, stated not hidden: the
+// i9-10885H target is also an 8-core AVX2 host at comparable clock, so the
+// anchor's per-layer constant carries over; re-calibrate per host class when
+// a target measurement exists.
+const CPU_LEG_OVERHEAD_NS_PER_CPU_LAYER: f64 = 6_390_000.0;
+
 // ---------------------------------------------------------------- legs
 struct Leg {
     ns: f64,
@@ -325,7 +338,10 @@ fn sweep(cpu: &Cpu, gpu: &Gpu, kernel: Kernel, packing: Packing, fixed_ns: f64) 
         let g = gpu_leg(gpu, gbytes, packing);
         let c = cpu_leg(cpu, cbytes, kernel, packing);
         let pcie = pcie_leg(D_MODEL * 4.0 * 2.0); // activation crossing, both ways
-        let t = g.ns + c.ns + pcie + (n_gpu as f64 + (N_LAYERS - n_gpu) as f64) * fixed_ns;
+        // the measured per-op overhead of the CPU leg (see the constant's
+        // provenance): charged per CPU-side layer, zero at full offload
+        let cpu_overhead = (N_LAYERS - n_gpu) as f64 * CPU_LEG_OVERHEAD_NS_PER_CPU_LAYER;
+        let t = g.ns + c.ns + pcie + cpu_overhead + (n_gpu as f64 + (N_LAYERS - n_gpu) as f64) * fixed_ns;
         rows.push((n_gpu, 1e9 / t, t / 1e6, format!("{}|{}", g.bound, c.bound)));
     }
     rows
@@ -377,6 +393,15 @@ fn main() {
     }
 
     println!("\n== local anchor rig: RTX 6000 + Xeon W-2140B ==");
+    // calibration check: the corrected sweep must reproduce the measured
+    // mixed point that set CPU_LEG_OVERHEAD_NS_PER_CPU_LAYER (plan/0008,
+    // 2026-09-24: 4.07 tok/s at ngl 37, repack on, op-offload off, t16)
+    {
+        let rows = sweep(&cpus()[6], &gpus()[1], Kernel::Repacked, Packing::Ptq10, fixed);
+        if let Some(row) = rows.iter().find(|r| r.0 == 37) {
+            println!("calibration check, PTQ1_0 repacked ngl 37: {:.2} tok/s (measured 4.07)", row.1);
+        }
+    }
     for packing in [Packing::Ptq10, Packing::Pq20] {
         let rows = sweep(&cpus()[6], &gpus()[1], Kernel::Repacked, packing, fixed);
         if let Some(best) = rows.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
