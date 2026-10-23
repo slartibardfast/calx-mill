@@ -1,0 +1,107 @@
+-- allium: 3
+-- specs/validity.allium — the kani-proven laws of calx-mill.
+--
+-- Scope: the properties calx-mill proves with #[cfg(kani)] harnesses
+-- (src/validity.rs, src/lib.rs, src/telemetry.rs) and nothing else.
+-- Every contract here is discharged by the harness named in the sibling
+-- .obligations manifest (kani: rungs, all inputs, not samples); the
+-- prose under each @invariant states the law the harness asserts.
+--
+-- The projection-validity doctrine is the governing host's fifth working
+-- principle (its plan/0144, markdown): a projection may GATE a decision
+-- only if it reproduces a measured anchor within its declared domain.
+-- The authority lattice below is that doctrine as code.
+
+-- ============================================================
+-- Values and enumerations
+-- ============================================================
+
+-- The authority tier a projection carries: unanchored advice, an
+-- anchored extrapolation, or a reproduced anchor point (the only tier
+-- that may gate).
+enum Authority { advisory | cross_checked | gate }
+
+-- How the query at hand relates to the anchor regime.
+enum DomainFit { at_anchor | in_domain | out_of_domain }
+
+-- ============================================================
+-- Contracts — one per kani harness
+-- ============================================================
+
+-- A1: the gate tier requires a reproduced anchor.
+contract GateRequiresAnchor {
+    invoke: (anchored: Boolean, fit: DomainFit) -> Authority
+
+    @invariant GateOnlyWhenAnchored
+        -- authority(anchored, fit) = gate only when anchored is true;
+        -- the unanchored arm can never return gate.
+}
+
+-- A3: no laundering — an unanchored projection is advice, never a gate.
+contract UnvalidatedNeverGates {
+    invoke: (anchored: Boolean, fit: DomainFit) -> Authority
+
+    @invariant UnanchoredIsAdvisory
+        -- authority(false, any fit) = advisory.
+}
+
+-- A2: outside the validated regime the projection is advice again.
+contract OutOfDomainIsAdvisory {
+    invoke: (anchored: Boolean, fit: DomainFit) -> Authority
+
+    @invariant OutsideMeansAdvisory
+        -- authority(anchored, out_of_domain) = advisory regardless of
+        -- the anchor.
+}
+
+-- A4 (monotone): composing projections never raises authority; the
+-- composition is at most the meet of its inputs.
+contract CompositionNeverRaises {
+    invoke: (a: Authority, b: Authority, composite_anchored: Boolean) -> Authority
+
+    @invariant ComposeAtMostMeet
+        -- compose(a, b, _) <= a and compose(a, b, _) <= b under the
+        -- authority lattice order.
+}
+
+-- A4 (cap): a composition of two gate-tier projections is at most
+-- cross_checked — extrapolation by composition, never a reproduced
+-- anchor.
+contract CompositionCapsAtCrossChecked {
+    invoke: (a: Authority, b: Authority, composite_anchored: Boolean) -> Authority
+
+    @invariant CappedUnderComposition
+        -- compose(a, b, false) <= cross_checked, and
+        -- compose(gate, gate, false) = cross_checked exactly.
+}
+
+-- The occupancy arithmetic: rounding up to a unit yields a multiple of
+-- the unit that is at least the input, and a zero unit leaves the input
+-- unchanged.
+contract RoundUpLaw {
+    invoke: (x: Integer, unit: Integer) -> Integer
+
+    @invariant MultipleAndAtLeast
+        -- round_up(x, unit) % unit = 0 (when unit > 0),
+        -- round_up(x, unit) >= x, and round_up(x, 0) = x.
+}
+
+-- Telemetry: records entirely ordered one before the other have zero
+-- measured overlap.
+contract DisjointOverlapIsZero {
+    invoke: (a: Integer, b: Integer) -> Decimal
+
+    @invariant DisjointMeansZero
+        -- when record a ends no later than record b starts,
+        -- overlap_fraction(a, b) = 0.
+}
+
+-- Telemetry: a record's wall time is never below its span, and an
+-- absent operation wall time reduces to the block-zero span.
+contract WallNeverBelowSpan {
+    invoke: (r: Integer) -> Integer
+
+    @invariant WallAtLeastSpan
+        -- wall_ns >= span_ns always, and op_wall_ns = 0 collapses
+        -- wall_ns to span_ns.
+}

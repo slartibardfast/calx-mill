@@ -1,0 +1,17 @@
+# specs/validity.obligations — every `allium plan` obligation
+# dispositioned. The seven contract-signature obligations are discharged
+# by the kani harnesses named (the declared rung: all inputs, proved, in
+# the cargo kani CI lane); the enums are the spec's own structure.
+
+enum-comparable.Authority => structural
+enum-comparable.DomainFit => structural
+# ... (A1 rides the same harness: its second assert is the
+# gate-requires-anchor law; see src/validity.rs.)
+contract-signature.GateRequiresAnchor.invoke => kani:out_of_domain_is_advisory
+contract-signature.UnvalidatedNeverGates.invoke => kani:unvalidated_never_gates
+contract-signature.OutOfDomainIsAdvisory.invoke => kani:out_of_domain_is_advisory
+contract-signature.CompositionNeverRaises.invoke => kani:composition_never_raises_authority
+contract-signature.CompositionCapsAtCrossChecked.invoke => kani:compose_caps_at_crosschecked
+contract-signature.RoundUpLaw.invoke => kani:round_up_is_a_multiple_and_ge_x
+contract-signature.DisjointOverlapIsZero.invoke => kani:t2_disjoint_overlap_is_zero
+contract-signature.WallNeverBelowSpan.invoke => kani:true_wall_never_below_block0_span

@@ -1,0 +1,38 @@
+# The spec lanes for calx-mill: allium (check/analyse/plan over the
+# validity spec) and the declared kani rung (every #[cfg(kani)] harness,
+# all inputs). Pins: allium-cli 3.4.2, kani-verifier 0.67.0 (the version
+# the proofs are recorded against, on its own fetched toolchain).
+name: Spec lanes
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  allium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install allium-cli (pinned)
+        run: cargo install allium-cli@3.4.2 --locked
+      - name: allium check
+        run: allium check specs/validity.allium
+      - name: allium analyse
+        run: allium analyse specs/validity.allium
+      - name: allium plan (the obligations the manifest dispositions)
+        run: allium plan specs/validity.allium
+
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the kani verifier (pinned)
+        run: cargo install --locked --version 0.67.0 kani-verifier
+      - name: cargo kani (the declared rung: every harness, all inputs)
+        run: cargo kani
